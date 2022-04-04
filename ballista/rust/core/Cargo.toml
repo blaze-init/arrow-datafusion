@@ -52,4 +52,4 @@ datafusion = { path = "../../../datafusion", version = "6.0.0" }
 tempfile = "3"
 
 [build-dependencies]
-tonic-build = { version = "0.6" }
+tonic-build = { version = "0.7" }
