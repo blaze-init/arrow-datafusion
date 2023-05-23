@@ -32,6 +32,7 @@ mod literal;
 mod negative;
 mod no_op;
 mod not;
+mod short_circuiting;
 mod try_cast;
 
 /// Module with some convenient methods used in expression building
@@ -92,6 +93,7 @@ pub use negative::{negative, NegativeExpr};
 pub use no_op::NoOp;
 pub use not::{not, NotExpr};
 pub use try_cast::{try_cast, TryCastExpr};
+pub use short_circuiting::{SCAndExpr, SCOrExpr};
 
 /// returns the name of the state
 pub fn format_state_name(name: &str, state_name: &str) -> String {

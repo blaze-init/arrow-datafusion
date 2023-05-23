@@ -19,7 +19,7 @@ use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::{any::Any, sync::Arc};
 
-use crate::expressions::try_cast;
+use crate::expressions::{Literal, try_cast};
 use crate::expressions::NoOp;
 use crate::physical_expr::down_cast_any_ref;
 use crate::PhysicalExpr;
@@ -199,11 +199,21 @@ impl CaseExpr {
 
         // start with nulls as default output
         let mut current_value = new_null_array(&return_type, batch.num_rows());
-        let mut remainder = BooleanArray::from(vec![true; batch.num_rows()]);
+        let mut remainder = None; // BooleanArray::from(vec![true; batch.num_rows()]);
         for i in 0..self.when_then_expr.len() {
-            let when_value = self.when_then_expr[i]
-                .0
-                .evaluate_selection(batch, &remainder)?;
+            let when_value = match &remainder {
+                None => self.when_then_expr[i].0.evaluate(batch)?,
+                Some(remainder) => self.when_then_expr[i]
+                    .0
+                    .evaluate_selection(batch, remainder)?,
+            };
+
+            let when_value = match when_value {
+                ColumnarValue::Scalar(value) if value.is_null() => {
+                    continue;
+                }
+                _ => when_value,
+            };
             let when_value = when_value.into_array(batch.num_rows())?;
             let when_value = as_boolean_array(&when_value).map_err(|e| {
                 DataFusionError::Context(
@@ -217,7 +227,10 @@ impl CaseExpr {
                 _ => Cow::Owned(prep_null_mask_filter(when_value)),
             };
             // Make sure we only consider rows that have not been matched yet
-            let when_value = and(&when_value, &remainder)?;
+            let when_value = match &remainder {
+                None => when_value,
+                Some(remainder) => Cow::Owned(and(&when_value, remainder)?),
+            };
 
             // When no rows available for when clause, skip then clause
             if when_value.true_count() == 0 {
@@ -242,20 +255,42 @@ impl CaseExpr {
 
             // Succeed tuples should be filtered out for short-circuit evaluation,
             // null values for the current when expr should be kept
-            remainder = and(&remainder, &not(&when_value)?)?;
+            remainder = Some(match remainder {
+                None => not(&when_value)?,
+                Some(remainder) => and(&remainder, &not(&when_value)?)?,
+            });
         }
 
         if let Some(e) = &self.else_expr {
             // keep `else_expr`'s data type and return type consistent
             let expr = try_cast(e.clone(), &batch.schema(), return_type.clone())
                 .unwrap_or_else(|_| e.clone());
-            let else_ = expr
-                .evaluate_selection(batch, &remainder)?
-                .into_array(batch.num_rows())?;
-            current_value = zip(&remainder, &else_, &current_value)?;
+            match &remainder {
+                Some(remainder) => {
+                    let else_ = expr
+                        .evaluate_selection(batch, &remainder)?
+                        .into_array(batch.num_rows())?;
+                    current_value = zip(&remainder, &else_, &current_value)?;
+                }
+                None => {
+                    let else_ = expr.evaluate(batch)?.into_array(batch.num_rows())?;
+                    current_value = else_.clone();
+                }
+            };
         }
-
         Ok(ColumnarValue::Array(current_value))
+    }
+
+    fn is_else_null(&self) -> bool {
+        match &self.else_expr {
+            Some(expr) => {
+                match expr.as_any().downcast_ref::<Literal>() {
+                    Some(lit) => lit.value().is_null(),
+                    None => false,
+                }
+            }
+            None => true,
+        }
     }
 }
 

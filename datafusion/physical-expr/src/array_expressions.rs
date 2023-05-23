@@ -39,7 +39,7 @@ use datafusion_common::{
     exec_err, internal_datafusion_err, internal_err, not_impl_err, plan_err,
     DataFusionError, Result, ScalarValue,
 };
-
+use datafusion_expr::ColumnarValue;
 use itertools::Itertools;
 
 macro_rules! downcast_arg {
@@ -319,6 +319,13 @@ fn array_array<O: OffsetSizeTrait>(
         arrow_array::make_array(data),
         None,
     )?))
+}
+
+/// check whether an array contains a value
+pub fn array_contains(values: &[ColumnarValue]) -> Result<ColumnarValue> {
+    let arg1 = values[0].clone().into_array(1)?;
+    let arg2 = values[1].clone().into_array(arg1.len())?;
+    Ok(ColumnarValue::Array(array_has(&[arg1, arg2])?))
 }
 
 /// `make_array` SQL function

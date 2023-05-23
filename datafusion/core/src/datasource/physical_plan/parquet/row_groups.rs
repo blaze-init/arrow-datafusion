@@ -15,20 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cell::{OnceCell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use arrow::{array::ArrayRef, datatypes::Schema};
 use arrow_array::BooleanArray;
 use arrow_schema::FieldRef;
+use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_array::{Array, ListArray};
+use arrow_schema::Field;
 use datafusion_common::{Column, ScalarValue};
 use parquet::basic::Type;
 use parquet::data_type::Decimal;
 use parquet::file::metadata::ColumnChunkMetaData;
-use parquet::schema::types::SchemaDescriptor;
 use parquet::{
     arrow::{async_reader::AsyncFileReader, ParquetRecordBatchStreamBuilder},
     bloom_filter::Sbbf,
-    file::metadata::RowGroupMetaData,
+    file::metadata::{ParquetMetaData, RowGroupMetaData},
 };
-use std::collections::{HashMap, HashSet};
 
 use crate::datasource::listing::FileRange;
 use crate::datasource::physical_plan::parquet::statistics::{
@@ -50,16 +54,21 @@ use super::ParquetFileMetrics;
 ///
 /// Note: This method currently ignores ColumnOrder
 /// <https://github.com/apache/arrow-datafusion/issues/8335>
-pub(crate) fn prune_row_groups_by_statistics(
-    arrow_schema: &Schema,
-    parquet_schema: &SchemaDescriptor,
-    groups: &[RowGroupMetaData],
+pub(crate) fn prune_row_groups_by_statistics<T: AsyncFileReader + Send + 'static>(
+    builder: &mut ParquetRecordBatchStreamBuilder<T>,
+    parquet_metadata: &ParquetMetaData,
+    retained_group_indices: &HashSet<usize>,
     range: Option<FileRange>,
     predicate: Option<&PruningPredicate>,
+    use_dictionary_filtering: bool,
     metrics: &ParquetFileMetrics,
 ) -> Vec<usize> {
+    let groups = parquet_metadata.row_groups();
     let mut filtered = Vec::with_capacity(groups.len());
     for (idx, metadata) in groups.iter().enumerate() {
+        if !retained_group_indices.contains(&idx) {
+            continue;
+        }
         if let Some(range) = &range {
             // figure out where the first dictionary page (or first data page are)
             // note don't use the location of metadata
@@ -75,9 +84,12 @@ pub(crate) fn prune_row_groups_by_statistics(
 
         if let Some(predicate) = predicate {
             let pruning_stats = RowGroupPruningStatistics {
-                parquet_schema,
                 row_group_metadata: metadata,
-                arrow_schema,
+                use_dictionary_filtering,
+                cached_dictionaries: vec![Default::default(); metadata.num_columns()],
+                builder: RefCell::new(builder),
+                parquet_metadata,
+                row_group_idx: idx,
             };
             match predicate.prune(&pruning_stats) {
                 Ok(values) => {
@@ -99,6 +111,10 @@ pub(crate) fn prune_row_groups_by_statistics(
         filtered.push(idx)
     }
     filtered
+}
+
+pub trait DictionaryExpander {
+    fn expand_dictionary(&self, col_idx: usize) -> Option<ArrayRef>;
 }
 
 /// Prune row groups by bloom filters
@@ -179,6 +195,10 @@ struct BloomFilterStatistics {
 }
 
 impl PruningStatistics for BloomFilterStatistics {
+    fn num_rows(&self, _column: &Column) -> Option<ArrayRef> {
+        None
+    }
+
     fn min_values(&self, _column: &Column) -> Option<ArrayRef> {
         None
     }
@@ -287,27 +307,56 @@ impl PruningStatistics for BloomFilterStatistics {
 
         Some(BooleanArray::from(vec![contains]))
     }
+
+    fn dictionary_values(&self, _column: &Column) -> Option<ArrayRef> {
+        None
+    }
 }
 
-/// Wraps [`RowGroupMetaData`] in a way that implements [`PruningStatistics`]
-///
-/// Note: This should be implemented for an array of [`RowGroupMetaData`] instead
-/// of per row-group
-struct RowGroupPruningStatistics<'a> {
-    parquet_schema: &'a SchemaDescriptor,
+/// Wraps parquet statistics in a way
+/// that implements [`PruningStatistics`]
+pub struct RowGroupPruningStatistics<'a, T: AsyncFileReader + Send + 'static> {
+    parquet_metadata: &'a ParquetMetaData,
     row_group_metadata: &'a RowGroupMetaData,
-    arrow_schema: &'a Schema,
+    use_dictionary_filtering: bool,
+    cached_dictionaries: Vec<OnceCell<Option<ArrayRef>>>,
+    builder: RefCell<&'a mut ParquetRecordBatchStreamBuilder<T>>,
+    row_group_idx: usize,
 }
 
-impl<'a> RowGroupPruningStatistics<'a> {
+impl<'a, T: AsyncFileReader + Send + 'static> RowGroupPruningStatistics<'a, T> {
     /// Lookups up the parquet column by name
     fn column(&self, name: &str) -> Option<(&ColumnChunkMetaData, &FieldRef)> {
-        let (idx, field) = parquet_column(self.parquet_schema, self.arrow_schema, name)?;
+        let (idx, field) = parquet_column(
+            self.builder.borrow().parquet_schema(),
+            unsafe {
+                std::mem::transmute::<_, &'a Schema>(self.builder.borrow().schema().as_ref())
+            },
+            name,
+        )?;
         Some((self.row_group_metadata.column(idx), field))
     }
 }
 
-impl<'a> PruningStatistics for RowGroupPruningStatistics<'a> {
+macro_rules! is_min_max_deprecated {
+    ($self:expr, $column:expr) => {{
+        $self
+            .row_group_metadata
+            .columns()
+            .iter()
+            .find(|c| c.column_path().string().eq_ignore_ascii_case(&$column.flat_name()))
+            .and_then(|c| c.statistics())
+            .map(|stat| stat.is_min_max_deprecated())
+            .unwrap_or(false)
+    }}
+}
+
+impl<'a, T: AsyncFileReader + Send + 'static> PruningStatistics for RowGroupPruningStatistics<'a, T> {
+    fn num_rows(&self, _column: &Column) -> Option<ArrayRef> {
+        let num_rows = self.row_group_metadata.num_rows();
+        ScalarValue::UInt64(Some(num_rows as u64)).to_array().ok()
+    }
+
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
         let (column, field) = self.column(&column.name)?;
         min_statistics(field.data_type(), std::iter::once(column.statistics())).ok()
@@ -334,6 +383,38 @@ impl<'a> PruningStatistics for RowGroupPruningStatistics<'a> {
         _values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray> {
         None
+    }
+
+    fn dictionary_values(&self, column: &Column) -> Option<ArrayRef> {
+        if !self.use_dictionary_filtering {
+            return None;
+        }
+        let col_idx = self
+            .row_group_metadata
+            .columns()
+            .iter()
+            .position(|c| c.column_path().string().eq_ignore_ascii_case(&column.flat_name()))?;
+
+        self.cached_dictionaries[col_idx].get_or_init(|| {
+            let dict_values = match futures::executor::block_on(async move {
+                parquet::blaze::get_dictionary_for_pruning(
+                    &mut self.builder.borrow_mut().input.0,
+                    self.parquet_metadata,
+                    self.row_group_idx,
+                    col_idx,
+                ).await
+            }) {
+                Ok(Some(dict_values)) => dict_values,
+                _ => return None,
+            };
+            let dict_array = ListArray::try_new(
+                Arc::new(Field::new("items", dict_values.data_type().clone(), false)),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0, dict_values.len() as i32])),
+                dict_values,
+                None,
+            ).ok()?;
+            Some(Arc::new(dict_array))
+        }).as_ref().cloned()
     }
 }
 

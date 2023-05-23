@@ -52,7 +52,7 @@ pub use analysis::{analyze, AnalysisContext, ExprBoundaries};
 pub use equivalence::EquivalenceProperties;
 pub use partitioning::{Distribution, Partitioning};
 pub use physical_expr::{
-    physical_exprs_bag_equal, physical_exprs_contains, physical_exprs_equal,
+    physical_exprs_bag_equal, physical_exprs_contains, physical_exprs_equal, scatter,
     PhysicalExpr, PhysicalExprRef,
 };
 pub use planner::create_physical_expr;

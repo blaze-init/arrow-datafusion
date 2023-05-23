@@ -21,7 +21,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::sort_properties::SortProperties;
-use crate::utils::scatter;
+pub use crate::utils::scatter;
 
 use arrow::array::BooleanArray;
 use arrow::compute::filter_record_batch;

@@ -135,7 +135,10 @@ pub(crate) fn parquet_column<'a>(
     arrow_schema: &'a Schema,
     name: &str,
 ) -> Option<(usize, &'a FieldRef)> {
-    let (root_idx, field) = arrow_schema.fields.find(name)?;
+    let (root_idx, field) = arrow_schema.fields
+        .iter()
+        .enumerate()
+        .find(|(_, field)| field.name().eq_ignore_ascii_case(name))?;
     if field.data_type().is_nested() {
         // Nested fields are not supported and require non-trivial logic
         // to correctly walk the parquet schema accounting for the

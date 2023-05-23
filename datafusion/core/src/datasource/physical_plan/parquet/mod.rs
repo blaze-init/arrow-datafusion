@@ -18,6 +18,7 @@
 //! Execution plan for reading Parquet files
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
@@ -63,10 +64,10 @@ use parquet::file::{metadata::ParquetMetaData, properties::WriterProperties};
 use parquet::schema::types::ColumnDescriptor;
 use tokio::task::JoinSet;
 
-mod metrics;
+pub mod metrics;
 pub mod page_filter;
-mod row_filter;
-mod row_groups;
+pub mod row_filter;
+pub mod row_groups;
 mod statistics;
 
 pub use metrics::ParquetFileMetrics;
@@ -420,22 +421,22 @@ impl ExecutionPlan for ParquetExec {
 }
 
 /// Implements [`FileOpener`] for a parquet file
-struct ParquetOpener {
-    partition_index: usize,
-    projection: Arc<[usize]>,
-    batch_size: usize,
-    limit: Option<usize>,
-    predicate: Option<Arc<dyn PhysicalExpr>>,
-    pruning_predicate: Option<Arc<PruningPredicate>>,
-    page_pruning_predicate: Option<Arc<PagePruningPredicate>>,
-    table_schema: SchemaRef,
-    metadata_size_hint: Option<usize>,
-    metrics: ExecutionPlanMetricsSet,
-    parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
-    pushdown_filters: bool,
-    reorder_filters: bool,
-    enable_page_index: bool,
-    enable_bloom_filter: bool,
+pub struct ParquetOpener {
+    pub partition_index: usize,
+    pub projection: Arc<[usize]>,
+    pub batch_size: usize,
+    pub limit: Option<usize>,
+    pub predicate: Option<Arc<dyn PhysicalExpr>>,
+    pub pruning_predicate: Option<Arc<PruningPredicate>>,
+    pub page_pruning_predicate: Option<Arc<PagePruningPredicate>>,
+    pub table_schema: SchemaRef,
+    pub metadata_size_hint: Option<usize>,
+    pub metrics: ExecutionPlanMetricsSet,
+    pub parquet_file_reader_factory: Arc<dyn ParquetFileReaderFactory>,
+    pub pushdown_filters: bool,
+    pub reorder_filters: bool,
+    pub enable_page_index: bool,
+    pub enable_bloom_filter: bool,
 }
 
 impl FileOpener for ParquetOpener {
@@ -474,7 +475,7 @@ impl FileOpener for ParquetOpener {
         let limit = self.limit;
 
         Ok(Box::pin(async move {
-            let options = ArrowReaderOptions::new().with_page_index(enable_page_index);
+            let options = ArrowReaderOptions::new();
             let mut builder =
                 ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
                     .await?;
@@ -515,16 +516,28 @@ impl FileOpener for ParquetOpener {
                 };
             };
 
-            // Row group pruning by statistics: attempt to skip entire row_groups
+            // Row group pruning: attempt to skip entire row_groups
             // using metadata on the row groups
+            // first run without dictionary filtering, to reduce io to dictionary pages
             let file_metadata = builder.metadata().clone();
             let predicate = pruning_predicate.as_ref().map(|p| p.as_ref());
-            let mut row_groups = row_groups::prune_row_groups_by_statistics(
-                &file_schema,
-                builder.parquet_schema(),
-                file_metadata.row_groups(),
-                file_range,
+            let row_groups = row_groups::prune_row_groups_by_statistics(
+                &mut builder,
+                &file_metadata,
+                &HashSet::from_iter(0..file_metadata.row_groups().len()),
+                file_range.clone(),
                 predicate,
+                false,
+                &file_metrics,
+            );
+            // second run with dictionary filtering
+            let mut row_groups = row_groups::prune_row_groups_by_statistics(
+                &mut builder,
+                &file_metadata,
+                &HashSet::from_iter(row_groups),
+                file_range.clone(),
+                predicate,
+                true,
                 &file_metrics,
             );
 
@@ -566,9 +579,35 @@ impl FileOpener for ParquetOpener {
                 builder = builder.with_limit(limit)
             }
 
+            // target batch size is usually 1MB ~ 16MB as there are lightweight compressions
+            // like RLE/DICT encodings
+            let adaptive_mem_size = 1048576;
+            let total_uncompressed_size = builder
+                .metadata()
+                .row_groups()
+                .iter()
+                .map(|rg| rg
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| mask.leaf_included(*idx))
+                        .map(|(_, col)| col.uncompressed_size())
+                        .sum::<i64>())
+                .sum::<i64>();
+            let total_num_rows = builder
+                .metadata()
+                .row_groups()
+                .iter()
+                .map(|rg| rg.num_rows())
+                .sum::<i64>();
+            let adaptive_batch_size = batch_size
+                .min((adaptive_mem_size * total_num_rows / total_uncompressed_size.max(1)) as usize)
+                .max(1);
+            log::info!("executing parquet scan with adaptive batch size: {adaptive_batch_size}");
+
             let stream = builder
                 .with_projection(mask)
-                .with_batch_size(batch_size)
+                .with_batch_size(adaptive_batch_size)
                 .with_row_groups(row_groups)
                 .build()?;
 

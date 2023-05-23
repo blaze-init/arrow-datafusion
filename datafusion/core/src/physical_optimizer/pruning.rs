@@ -35,6 +35,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
+use arrow_array::{Array, ArrowNativeTypeOp, Float32Array, Float64Array};
 use arrow_array::cast::AsArray;
 use datafusion_common::{
     internal_err, plan_err,
@@ -42,8 +43,15 @@ use datafusion_common::{
 };
 use datafusion_common::{plan_datafusion_err, ScalarValue};
 use datafusion_physical_expr::utils::{collect_columns, Guarantee, LiteralGuarantee};
-use datafusion_physical_expr::{expressions as phys_expr, PhysicalExprRef};
+use datafusion_expr::BuiltinScalarFunction;
+use datafusion_physical_expr::{expressions as phys_expr, PhysicalExprRef, ScalarFunctionExpr};
+use datafusion_physical_expr::{
+    execution_props::ExecutionProps,
+    functions::create_physical_fun,
+};
 use log::trace;
+use datafusion_common::cast::{as_float32_array, as_float64_array};
+use datafusion_physical_expr::array_expressions::array_contains;
 
 /// A source of runtime statistical information to [`PruningPredicate`]s.
 ///
@@ -78,6 +86,11 @@ use log::trace;
 /// min_values("X") -> None
 /// ```
 pub trait PruningStatistics {
+    /// return the number of values (including nulls)
+    fn num_rows(&self, column: &Column) -> Option<ArrayRef>;
+
+    /// return the minimum values for the named column, if known.
+    /// Note: the returned array must contain `num_containers()` rows
     /// Return the minimum values for the named column, if known.
     ///
     /// If the minimum value for a particular container is not known, the
@@ -130,6 +143,9 @@ pub trait PruningStatistics {
         column: &Column,
         values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray>;
+
+    /// return dictionary values for the named column as ListArray<?>
+    fn dictionary_values(&self, column: &Column) -> Option<ArrayRef>;
 }
 
 /// Used to prove that arbitrary predicates (boolean expression) can not
@@ -707,6 +723,16 @@ impl RequiredColumns {
         rewrite_column_expr(column_expr.clone(), column, &stat_column)
     }
 
+    /// rewrite col --> col_num_rows
+    fn num_rows_column_expr(
+        &mut self,
+        column: &phys_expr::Column,
+        column_expr: &Arc<dyn PhysicalExpr>,
+        field: &Field,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        self.stat_column_expr(column, column_expr, field, StatisticsType::NumValues, "num_rows")
+    }
+
     /// rewrite col --> col_min
     fn min_column_expr(
         &mut self,
@@ -740,6 +766,26 @@ impl RequiredColumns {
             field,
             StatisticsType::NullCount,
             "null_count",
+        )
+    }
+
+    /// rewrite col --> col_dict
+    fn dict_column_expr(
+        &mut self,
+        column: &phys_expr::Column,
+        column_expr: &Arc<dyn PhysicalExpr>,
+        field: &Field,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+
+        let list_type = DataType::List(Arc::new(
+            Field::new("items", field.data_type().clone(), false)
+        ));
+        self.stat_column_expr(
+            column,
+            column_expr,
+            &field.clone().with_data_type(list_type),
+            StatisticsType::Dictionary,
+            "dict",
         )
     }
 }
@@ -788,11 +834,7 @@ fn build_statistics_record_batch<S: PruningStatistics>(
 
         let num_containers = statistics.num_containers();
 
-        let array = match statistics_type {
-            StatisticsType::Min => statistics.min_values(&column),
-            StatisticsType::Max => statistics.max_values(&column),
-            StatisticsType::NullCount => statistics.null_counts(&column),
-        };
+        let array = build_statistics_array(statistics, statistics_type, &column);
         let array = array.unwrap_or_else(|| new_null_array(data_type, num_containers));
 
         if num_containers != array.len() {
@@ -805,7 +847,17 @@ fn build_statistics_record_batch<S: PruningStatistics>(
 
         // cast statistics array to required data type (e.g. parquet
         // provides timestamp statistics as "Int64")
-        let array = arrow::compute::cast(&array, data_type)?;
+        // blaze:
+        // cast to target data type before adding columns
+        extern "Rust" {
+            fn schema_adapter_cast_column(
+                col: &ArrayRef,
+                data_type: &DataType,
+            ) -> Result<ArrayRef>;
+        }
+        let array = unsafe {
+            schema_adapter_cast_column(&array, data_type)?
+        };
 
         fields.push(stat_field.clone());
         arrays.push(array);
@@ -825,6 +877,90 @@ fn build_statistics_record_batch<S: PruningStatistics>(
     RecordBatch::try_new_with_options(schema, arrays, &options).map_err(|err| {
         plan_datafusion_err!("Can not create statistics record batch: {err}")
     })
+}
+
+/// build column stat array from statistics
+/// handling special float cases of min/max values like NaN, -0.0, and 0.0
+fn build_statistics_array<S: PruningStatistics>(
+    statistics: &S,
+    statistics_type: &StatisticsType,
+    column: &Column,
+) -> Option<ArrayRef> {
+
+    let array = match statistics_type {
+        StatisticsType::NumValues => statistics.num_rows(&column),
+        StatisticsType::Min => statistics.min_values(&column),
+        StatisticsType::Max => statistics.max_values(&column),
+        StatisticsType::NullCount => statistics.null_counts(&column),
+        StatisticsType::Dictionary => statistics.dictionary_values(&column),
+    };
+    if let Some(array) = array {
+        if array.data_type().is_floating() {
+            let min_values = statistics.min_values(&column);
+            let max_values = statistics.max_values(&column);
+
+            let min_is_nan = min_values.clone().and_then(|array| {
+                match array.data_type() {
+                    DataType::Float32 => Some(as_float32_array(&array).ok()?.value(0).is_nan()),
+                    DataType::Float64 => Some(as_float64_array(&array).ok()?.value(0).is_nan()),
+                    _ => return None,
+                }
+            })?;
+            let max_is_nan = max_values.clone().and_then(|array| {
+                match array.data_type() {
+                    DataType::Float32 => Some(as_float32_array(&array).ok()?.value(0).is_nan()),
+                    DataType::Float64 => Some(as_float64_array(&array).ok()?.value(0).is_nan()),
+                    _ => return None,
+                }
+            })?;
+            let min_is_positive_0 = min_values.clone().and_then(|array| {
+                match array.data_type() {
+                    DataType::Float32 => Some({
+                        let v = as_float32_array(&array).ok()?.value(0);
+                        v.is_sign_positive() && v.is_zero()
+                    } ),
+                    DataType::Float64 => Some({
+                        let v = as_float64_array(&array).ok()?.value(0);
+                        v.is_sign_positive() && v.is_zero()
+                    }),
+                    _ => return None,
+                }
+            })?;
+            let max_is_negative_0 = max_values.clone().and_then(|array| {
+                match array.data_type() {
+                    DataType::Float32 => Some({
+                        let v = as_float32_array(&array).ok()?.value(0);
+                        v.is_sign_negative() && v.is_zero()
+                    } ),
+                    DataType::Float64 => Some({
+                        let v = as_float64_array(&array).ok()?.value(0);
+                        v.is_sign_negative() && v.is_zero()
+                    }),
+                    _ => return None,
+                }
+            })?;
+
+            if min_is_nan || max_is_nan {
+                return None;
+            }
+            if min_is_positive_0 && *statistics_type == StatisticsType::Min {
+                return match array.data_type() {
+                    DataType::Float32 => Some(Arc::new(Float32Array::from_value(-0.0f32, 1))),
+                    DataType::Float64 => Some(Arc::new(Float64Array::from_value(-0.0f64, 1))),
+                    _ => None,
+                };
+            }
+            if max_is_negative_0 && *statistics_type == StatisticsType::Max {
+                return match array.data_type() {
+                    DataType::Float32 => Some(Arc::new(Float32Array::from_value(0.0f32, 1))),
+                    DataType::Float64 => Some(Arc::new(Float64Array::from_value(0.0f64, 1))),
+                    _ => None,
+                };
+            }
+        }
+        return Some(array);
+    }
+    return None;
 }
 
 struct PruningExpressionBuilder<'a> {
@@ -901,6 +1037,23 @@ impl<'a> PruningExpressionBuilder<'a> {
         self.required_columns
             .max_column_expr(&self.column, &self.column_expr, self.field)
     }
+
+    fn dict_column_expr(&mut self) -> Result<Arc<dyn PhysicalExpr>> {
+        self.required_columns
+            .dict_column_expr(&self.column, &self.column_expr, self.field)
+    }
+
+    fn dict_column_contains_expr(&mut self) -> Result<Arc<dyn PhysicalExpr>> {
+        Ok(Arc::new(ScalarFunctionExpr::new(
+            "array_contains",
+            Arc::new(array_contains),
+            vec![self.dict_column_expr()?, self.scalar_expr().clone()],
+            DataType::Boolean,
+            None,
+            false,
+        )))
+    }
+
 }
 
 /// This function is designed to rewrite the column_expr to
@@ -1102,19 +1255,110 @@ fn build_is_null_column_expr(
 ) -> Option<Arc<dyn PhysicalExpr>> {
     if let Some(col) = expr.as_any().downcast_ref::<phys_expr::Column>() {
         let field = schema.field_with_name(col.name()).ok()?;
+        if field.data_type().is_nested() {
+            return None;
+        }
 
         let null_count_field = &Field::new(field.name(), DataType::UInt64, true);
-        required_columns
-            .null_count_column_expr(col, expr, null_count_field)
-            .map(|null_count_column_expr| {
-                // IsNull(column) => null_count > 0
-                Arc::new(phys_expr::BinaryExpr::new(
-                    null_count_column_expr,
-                    Operator::Gt,
-                    Arc::new(phys_expr::Literal::new(ScalarValue::UInt64(Some(0)))),
-                )) as _
-            })
-            .ok()
+        let null_count_column_expr = required_columns
+            .null_count_column_expr(col, expr, null_count_field).ok()?;
+
+        // IsNull(column) => null_count is null or null_count > 0
+        let is_null = phys_expr::is_null(null_count_column_expr.clone()).ok()?;
+        let gt_0 = phys_expr::binary(
+            null_count_column_expr,
+            Operator::Gt,
+            phys_expr::lit(0u64),
+            schema,
+        ).ok()?;
+        phys_expr::binary(is_null, Operator::Or, gt_0, schema).ok()
+
+    } else {
+        None
+    }
+}
+
+fn build_is_not_null_column_expr(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+    required_columns: &mut RequiredColumns,
+) -> Option<Arc<dyn PhysicalExpr>> {
+    if let Some(col) = expr.as_any().downcast_ref::<phys_expr::Column>() {
+        let field = schema.field_with_name(col.name()).ok()?;
+        if field.data_type().is_nested() {
+            return None;
+        }
+
+        let null_count_field = &Field::new(field.name(), DataType::UInt64, true);
+        let null_count_column_expr = required_columns
+            .null_count_column_expr(col, expr, null_count_field).ok()?;
+
+        let num_rows_field = null_count_field;
+        let num_rows_column_expr = required_columns
+            .num_rows_column_expr(col, expr, num_rows_field).ok()?;
+
+        // IsNotNull(column) => null_count is null or null_count != num_rows
+        let is_null = phys_expr::is_null(null_count_column_expr.clone()).ok()?;
+        let ne = phys_expr::binary(
+            null_count_column_expr,
+            Operator::NotEq,
+            num_rows_column_expr,
+            schema,
+        ).ok()?;
+        phys_expr::binary(is_null, Operator::Or, ne, schema).ok()
+
+    } else {
+        None
+    }
+}
+
+fn build_starts_with_expr(
+    expr: &Arc<dyn PhysicalExpr>,
+    prefix: &str,
+    schema: &Schema,
+    required_columns: &mut RequiredColumns,
+) -> Option<Arc<dyn PhysicalExpr>> {
+    if let Some(col) = expr.as_any().downcast_ref::<phys_expr::Column>() {
+        let field = schema.field_with_name(col.name()).ok()?;
+
+        let min_field = &Field::new(field.name(), DataType::UInt64, true);
+        let min_column_expr = required_columns.min_column_expr(col, expr, min_field).ok()?;
+
+        let max_field = &min_field.clone();
+        let max_column_expr = required_columns.max_column_expr(col, expr, max_field).ok()?;
+
+        let lit_prefix = phys_expr::lit(prefix.to_owned());
+        let lit_1 = phys_expr::lit(1i64);
+        let lit_len = phys_expr::lit(prefix.len() as i64);
+
+        let execution_props = ExecutionProps::new();
+        let substr_fn = create_physical_fun(
+            &BuiltinScalarFunction::Substr,
+            &execution_props,
+        ).ok()?;
+
+        let min_prefix = Arc::new(ScalarFunctionExpr::new(
+            "substr",
+            substr_fn.clone(),
+            vec![min_column_expr, lit_1.clone(), lit_len.clone()],
+            DataType::Utf8,
+            None,
+            false,
+        ));
+        let max_prefix = Arc::new(ScalarFunctionExpr::new(
+            "substr",
+            substr_fn.clone(),
+            vec![max_column_expr, lit_1.clone(), lit_len.clone()],
+            DataType::Utf8,
+            None,
+            false,
+        ));
+
+        Some(Arc::new(phys_expr::SCAndExpr::new(
+            phys_expr::binary(min_prefix, Operator::LtEq, lit_prefix.clone(), schema).ok()?,
+            phys_expr::binary(max_prefix, Operator::GtEq, lit_prefix.clone(), schema).ok()?,
+        )))
+
     } else {
         None
     }
@@ -1144,6 +1388,10 @@ fn build_predicate_expression(
     let expr_any = expr.as_any();
     if let Some(is_null) = expr_any.downcast_ref::<phys_expr::IsNullExpr>() {
         return build_is_null_column_expr(is_null.arg(), schema, required_columns)
+            .unwrap_or(unhandled);
+    }
+    if let Some(is_not_null) = expr_any.downcast_ref::<phys_expr::IsNotNullExpr>() {
+        return build_is_not_null_column_expr(is_not_null.arg(), schema, required_columns)
             .unwrap_or(unhandled);
     }
     if let Some(col) = expr_any.downcast_ref::<phys_expr::Column>() {
@@ -1184,12 +1432,43 @@ fn build_predicate_expression(
                         e.clone(),
                     )) as _
                 })
-                .reduce(|a, b| Arc::new(phys_expr::BinaryExpr::new(a, re_op, b)) as _)
+                .reduce(|a, b| Arc::new(phys_expr::BinaryExpr::new(a, re_op, b)))
                 .unwrap();
             return build_predicate_expression(&change_expr, schema, required_columns);
         } else {
             return unhandled;
         }
+    }
+    if let Some(sc_and) = expr_any.downcast_ref::<phys_expr::SCAndExpr>() {
+        let left_expr = build_predicate_expression(&sc_and.left, schema, required_columns);
+        let right_expr = build_predicate_expression(&sc_and.right, schema, required_columns);
+        return match (&left_expr, &right_expr) {
+            (l, _) if is_always_true(l) => right_expr,
+            (_, r) if is_always_true(r) => left_expr,
+            (_, _) => Arc::new(phys_expr::SCAndExpr::new(left_expr, right_expr)),
+        };
+    }
+    if let Some(sc_or) = expr_any.downcast_ref::<phys_expr::SCOrExpr>() {
+        let left_expr = build_predicate_expression(&sc_or.left, schema, required_columns);
+        let right_expr = build_predicate_expression(&sc_or.right, schema, required_columns);
+        if is_always_true(&left_expr) || is_always_true(&right_expr) {
+            return unhandled;
+        } else {
+            return Arc::new(phys_expr::SCOrExpr::new(left_expr, right_expr));
+        }
+    }
+    if let Some(scalar_fn) = expr_any.downcast_ref::<ScalarFunctionExpr>() {
+        if scalar_fn.name() == "starts_with" {
+            let arg1 = &scalar_fn.args()[0];
+            let arg2 = &scalar_fn.args()[1];
+            if let Some(literal) = arg2.as_any().downcast_ref::<phys_expr::Literal>() {
+                if let ScalarValue::Utf8(Some(prefix)) = literal.value() {
+                    return build_starts_with_expr(arg1, prefix, schema, required_columns)
+                        .unwrap_or(unhandled);
+                }
+            }
+        }
+        return unhandled;
     }
 
     let (left, op, right) = {
@@ -1216,7 +1495,9 @@ fn build_predicate_expression(
             {
                 unhandled
             }
-            _ => Arc::new(phys_expr::BinaryExpr::new(left_expr, op, right_expr)),
+            (_, Operator::And, _) => Arc::new(phys_expr::SCAndExpr::new(left_expr, right_expr)),
+            (_, Operator::Or, _) => Arc::new(phys_expr::SCOrExpr::new(left_expr, right_expr)),
+            _ => unreachable!(),
         };
         return expr;
     }
@@ -1264,7 +1545,7 @@ fn build_statistics_expr(
             // (column / 2) = 4 => (column_min / 2) <= 4 && 4 <= (column_max / 2)
             let min_column_expr = expr_builder.min_column_expr()?;
             let max_column_expr = expr_builder.max_column_expr()?;
-            Arc::new(phys_expr::BinaryExpr::new(
+            let stat_pred_expr = Arc::new(phys_expr::BinaryExpr::new(
                 Arc::new(phys_expr::BinaryExpr::new(
                     min_column_expr,
                     Operator::LtEq,
@@ -1276,6 +1557,16 @@ fn build_statistics_expr(
                     Operator::LtEq,
                     max_column_expr,
                 )),
+            ));
+
+            // append dict_pred expr (stat && dictionary_contains(column))
+            let dict = expr_builder.dict_column_expr()?;
+            let has_no_stat_pred = Arc::new(phys_expr::IsNullExpr::new(stat_pred_expr.clone()));
+            let has_no_dict = Arc::new(phys_expr::IsNullExpr::new(dict));
+            let dict_contained = expr_builder.dict_column_contains_expr()?;
+            Arc::new(phys_expr::SCAndExpr::new(
+                Arc::new(phys_expr::SCOrExpr::new(has_no_stat_pred, stat_pred_expr)),
+                Arc::new(phys_expr::SCOrExpr::new(has_no_dict, dict_contained))
             ))
         }
         Operator::Gt => {
@@ -1322,9 +1613,11 @@ fn build_statistics_expr(
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum StatisticsType {
+    NumValues,
     Min,
     Max,
     NullCount,
+    Dictionary,
 }
 
 #[cfg(test)]

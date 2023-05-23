@@ -505,6 +505,10 @@ macro_rules! get_min_max_values_for_page_index {
 }
 
 impl<'a> PruningStatistics for PagesPruningStatistics<'a> {
+    fn num_rows(&self, _column: &datafusion_common::Column) -> Option<ArrayRef> {
+        None
+    }
+
     fn min_values(&self, _column: &datafusion_common::Column) -> Option<ArrayRef> {
         get_min_max_values_for_page_index!(self, min)
     }
@@ -552,6 +556,11 @@ impl<'a> PruningStatistics for PagesPruningStatistics<'a> {
         _column: &datafusion_common::Column,
         _values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray> {
+        None
+    }
+
+    fn dictionary_values(&self, _column: &datafusion_common::Column) -> Option<ArrayRef> {
+        // dictionary filtering does not work in page pruning
         None
     }
 }

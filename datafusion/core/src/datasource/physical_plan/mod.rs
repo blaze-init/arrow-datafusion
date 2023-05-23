@@ -52,7 +52,7 @@ use std::{
 };
 
 use super::listing::ListingTableUrl;
-use crate::error::{DataFusionError, Result};
+use crate::error::Result;
 use crate::physical_plan::{DisplayAs, DisplayFormatType};
 use crate::{
     datasource::{
@@ -63,12 +63,11 @@ use crate::{
 };
 
 use arrow::{
-    array::new_null_array,
-    compute::{can_cast_types, cast},
+    array::{ArrayRef, new_null_array},
     datatypes::{DataType, Schema, SchemaRef},
     record_batch::{RecordBatch, RecordBatchOptions},
 };
-use datafusion_common::{file_options::FileTypeWriterOptions, plan_err};
+use datafusion_common::file_options::FileTypeWriterOptions;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::PhysicalSortExpr;
 use datafusion_physical_plan::ExecutionPlan;
@@ -259,13 +258,13 @@ where
 ///    indexes and insert null-valued columns wherever the file schema was missing a colum present
 ///    in the table schema.
 #[derive(Clone, Debug)]
-pub(crate) struct SchemaAdapter {
+pub struct SchemaAdapter {
     /// Schema for the table
     table_schema: SchemaRef,
 }
 
 impl SchemaAdapter {
-    pub(crate) fn new(table_schema: SchemaRef) -> SchemaAdapter {
+    pub fn new(table_schema: SchemaRef) -> SchemaAdapter {
         Self { table_schema }
     }
 
@@ -273,7 +272,7 @@ impl SchemaAdapter {
     /// file schema
     ///
     /// Panics if index is not in range for the table schema
-    pub(crate) fn map_column_index(
+    pub fn map_column_index(
         &self,
         index: usize,
         file_schema: &Schema,
@@ -298,23 +297,15 @@ impl SchemaAdapter {
         let mut field_mappings = vec![None; self.table_schema.fields().len()];
 
         for (file_idx, file_field) in file_schema.fields.iter().enumerate() {
-            if let Some((table_idx, table_field)) =
-                self.table_schema.fields().find(file_field.name())
+            if let Some((table_idx, _table_field)) = self.table_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .find(|(_, b)| b.name().eq_ignore_ascii_case(file_field.name()))
             {
-                match can_cast_types(file_field.data_type(), table_field.data_type()) {
-                    true => {
-                        field_mappings[table_idx] = Some(projection.len());
-                        projection.push(file_idx);
-                    }
-                    false => {
-                        return plan_err!(
-                            "Cannot cast file schema field {} of type {:?} to table schema field of type {:?}",
-                            file_field.name(),
-                            file_field.data_type(),
-                            table_field.data_type()
-                        )
-                    }
-                }
+                // blaze: no need to check with can_cast_types()
+                field_mappings[table_idx] = Some(projection.len());
+                projection.push(file_idx);
             }
         }
 
@@ -344,13 +335,24 @@ impl SchemaMapping {
         let batch_rows = batch.num_rows();
         let batch_cols = batch.columns().to_vec();
 
+        // blaze:
+        // cast to target data type before adding columns
+        extern "Rust" {
+            fn schema_adapter_cast_column(
+                col: &ArrayRef,
+                data_type: &DataType,
+            ) -> Result<ArrayRef>;
+        }
+
         let cols = self
             .table_schema
             .fields()
             .iter()
             .zip(&self.field_mappings)
             .map(|(field, file_idx)| match file_idx {
-                Some(batch_idx) => cast(&batch_cols[*batch_idx], field.data_type()),
+                Some(batch_idx) => unsafe {
+                    schema_adapter_cast_column(&batch_cols[*batch_idx], field.data_type())
+                }
                 None => Ok(new_null_array(field.data_type(), batch_rows)),
             })
             .collect::<Result<Vec<_>, _>>()?;
