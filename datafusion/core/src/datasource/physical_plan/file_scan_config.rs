@@ -158,7 +158,7 @@ impl FileScanConfig {
                 table_fields.push(Field::new(
                     &self.table_partition_cols[partition_idx].0,
                     self.table_partition_cols[partition_idx].1.to_owned(),
-                    false,
+                    true, // blaze: spark allows nullable partition key
                 ));
                 // TODO provide accurate stat for partition column (#1186)
                 table_cols_stats.push(ColumnStatistics::default())
@@ -192,7 +192,7 @@ impl FileScanConfig {
         })
     }
 
-    pub(crate) fn file_column_projection_indices(&self) -> Option<Vec<usize>> {
+    pub fn file_column_projection_indices(&self) -> Option<Vec<usize>> {
         self.projection.as_ref().map(|p| {
             p.iter()
                 .filter(|col_idx| **col_idx < self.file_schema.fields().len())

@@ -444,6 +444,67 @@ fn array(values: &[ColumnarValue]) -> Result<ColumnarValue> {
     }
 }
 
+/// check whether an array contains a value
+pub fn array_contains(values: &[ColumnarValue]) -> Result<ColumnarValue> {
+    // slow implementation, only used in parquet dictionary filtering
+    let arg1 = values[0].clone().into_array(1);
+    let arg2 = values[1].clone().into_array(arg1.len());
+    let list = as_list_array(&arg1)?;
+
+    macro_rules! handle_primitive {
+        ($dt:ident) => {{
+            use arrow::datatypes::*;
+            let value: &PrimitiveArray<$dt> = as_primitive_array(&arg2);
+            return Ok(ColumnarValue::Array(Arc::new(arrow::compute::in_list(value, list)?)));
+        }}
+    }
+    match arg2.data_type() {
+        DataType::Int8 => handle_primitive!(Int8Type),
+        DataType::Int16 => handle_primitive!(Int16Type),
+        DataType::Int32 => handle_primitive!(Int32Type),
+        DataType::Int64 => handle_primitive!(Int64Type),
+        DataType::Float32 => handle_primitive!(Float32Type),
+        DataType::Float64 => handle_primitive!(Float64Type),
+        DataType::Date32 => handle_primitive!(Date32Type),
+        DataType::Date64 => handle_primitive!(Date64Type),
+        DataType::Utf8 => {
+            let values = as_string_array(&arg2);
+            Ok(ColumnarValue::Array(Arc::new(list
+                .iter()
+                .zip(values.iter())
+                .map(|(item, value)| {
+                    match item.as_ref() {
+                        Some(item) if value.is_some() => {
+                            let strings = as_string_array(item);
+                            Some(strings.iter().contains(&value))
+                        }
+                        _ => None
+                    }
+                })
+                .collect::<BooleanArray>())))
+        },
+        DataType::Binary => {
+            let values = as_generic_binary_array::<i32>(&arg2);
+            Ok(ColumnarValue::Array(Arc::new(list
+                .iter()
+                .zip(values.iter())
+                .map(|(item, value)| {
+                    match item.as_ref() {
+                        Some(item) if value.is_some() => {
+                            let binaries = as_generic_binary_array::<i32>(item);
+                            Some(binaries.iter().contains(&value))
+                        }
+                        _ => None
+                    }
+                })
+                .collect::<BooleanArray>())))
+        },
+        other => return Err(DataFusionError::NotImplemented(
+           format!("array_contains unsupported data type: {other}")
+        )),
+    }
+}
+
 /// `make_array` SQL function
 pub fn make_array(arrays: &[ArrayRef]) -> Result<ArrayRef> {
     let values: Vec<ColumnarValue> = arrays

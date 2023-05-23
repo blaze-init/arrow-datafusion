@@ -15,17 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cell::{OnceCell, RefCell};
+use std::collections::HashSet;
+use std::sync::Arc;
 use arrow::{
     array::ArrayRef,
     datatypes::{DataType, Schema},
 };
+use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_array::{Array, ListArray};
+use arrow_schema::Field;
 use datafusion_common::Column;
 use datafusion_common::ScalarValue;
 use log::debug;
+use parquet::arrow::async_reader::{AsyncFileReader, AsyncReader};
+use parquet::arrow::ParquetRecordBatchStreamBuilder;
 
 use parquet::file::{
     metadata::RowGroupMetaData, statistics::Statistics as ParquetStatistics,
 };
+use parquet::file::metadata::ParquetMetaData;
 
 use crate::datasource::physical_plan::parquet::{
     from_bytes_to_i128, parquet_to_arrow_decimal_type,
@@ -44,14 +53,21 @@ use super::ParquetFileMetrics;
 ///
 /// If an index IS present in the returned Vec it means the predicate
 /// did not filter out that row group.
-pub(crate) fn prune_row_groups(
-    groups: &[RowGroupMetaData],
+pub fn prune_row_groups<T: AsyncFileReader + Send + 'static>(
+    builder: &mut ParquetRecordBatchStreamBuilder<T>,
+    parquet_metadata: &ParquetMetaData,
+    retained_group_indices: &HashSet<usize>,
     range: Option<FileRange>,
     predicate: Option<&PruningPredicate>,
+    use_dictionary_filtering: bool,
     metrics: &ParquetFileMetrics,
 ) -> Vec<usize> {
+    let groups = parquet_metadata.row_groups();
     let mut filtered = Vec::with_capacity(groups.len());
     for (idx, metadata) in groups.iter().enumerate() {
+        if !retained_group_indices.contains(&idx) {
+            continue;
+        }
         if let Some(range) = &range {
             // figure out where the first dictionary page (or first data page are)
             // note don't use the location of metadata
@@ -67,8 +83,13 @@ pub(crate) fn prune_row_groups(
 
         if let Some(predicate) = predicate {
             let pruning_stats = RowGroupPruningStatistics {
-                row_group_metadata: metadata,
+                use_dictionary_filtering,
+                cached_dictionaries: vec![Default::default(); metadata.num_columns()],
+                input: RefCell::new(&mut builder.input),
                 parquet_schema: predicate.schema().as_ref(),
+                parquet_metadata,
+                row_group_metadata: metadata,
+                row_group_idx: idx,
             };
             match predicate.prune(&pruning_stats) {
                 Ok(values) => {
@@ -92,11 +113,20 @@ pub(crate) fn prune_row_groups(
     filtered
 }
 
+pub trait DictionaryExpander {
+    fn expand_dictionary(&self, col_idx: usize) -> Option<ArrayRef>;
+}
+
 /// Wraps parquet statistics in a way
 /// that implements [`PruningStatistics`]
-struct RowGroupPruningStatistics<'a> {
-    row_group_metadata: &'a RowGroupMetaData,
+pub struct RowGroupPruningStatistics<'a, T: AsyncFileReader + Send + 'static> {
+    use_dictionary_filtering: bool,
+    cached_dictionaries: Vec<OnceCell<Option<ArrayRef>>>,
+    input: RefCell<&'a mut AsyncReader<T>>,
     parquet_schema: &'a Schema,
+    parquet_metadata: &'a ParquetMetaData,
+    row_group_metadata: &'a RowGroupMetaData,
+    row_group_idx: usize,
 }
 
 /// Extract the min/max statistics from a `ParquetStatistics` object
@@ -177,7 +207,12 @@ macro_rules! get_statistic {
 macro_rules! get_min_max_values {
     ($self:expr, $column:expr, $func:ident, $bytes_func:ident) => {{
         let (_column_index, field) =
-            if let Some((v, f)) = $self.parquet_schema.column_with_name(&$column.name) {
+            if let Some((v, f)) = $self.parquet_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .find(|&(_, c)| c.name().eq_ignore_ascii_case(&$column.name))
+            {
                 (v, f)
             } else {
                 // Named column was not present
@@ -191,7 +226,7 @@ macro_rules! get_min_max_values {
         $self.row_group_metadata
             .columns()
             .iter()
-            .find(|c| c.column_descr().name() == &$column.name)
+            .find(|c| c.column_path().string().eq_ignore_ascii_case(&$column.flat_name()))
             .and_then(|c| if c.statistics().is_some() {Some((c.statistics().unwrap(), c.column_descr()))} else {None})
             .map(|(stats, column_descr)|
                 {
@@ -213,7 +248,7 @@ macro_rules! get_null_count_values {
                 .row_group_metadata
                 .columns()
                 .iter()
-                .find(|c| c.column_descr().name() == &$column.name)
+                .find(|c| c.column_path().string().eq_ignore_ascii_case(&$column.flat_name()))
             {
                 col.statistics().map(|s| s.null_count())
             } else {
@@ -225,12 +260,48 @@ macro_rules! get_null_count_values {
     }};
 }
 
-impl<'a> PruningStatistics for RowGroupPruningStatistics<'a> {
+macro_rules! is_min_max_deprecated {
+    ($self:expr, $column:expr) => {{
+        $self
+            .row_group_metadata
+            .columns()
+            .iter()
+            .find(|c| c.column_path().string().eq_ignore_ascii_case(&$column.flat_name()))
+            .and_then(|c| c.statistics())
+            .map(|stat| stat.is_min_max_deprecated())
+            .unwrap_or(false)
+    }}
+}
+
+impl<'a, T: AsyncFileReader + Send + 'static> PruningStatistics for RowGroupPruningStatistics<'a, T> {
+    fn num_rows(&self, _column: &Column) -> Option<ArrayRef> {
+        let num_rows = self.row_group_metadata.num_rows();
+        Some(ScalarValue::UInt64(Some(num_rows as u64)).to_array())
+    }
+
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+        if is_min_max_deprecated!(self, column) {
+            // use deprecated min/max values only when min == max
+            let min_values = get_min_max_values!(self, column, min, min_bytes);
+            let max_values = get_min_max_values!(self, column, max, max_bytes);
+            if min_values == max_values {
+                return min_values;
+            }
+            return None;
+        }
         get_min_max_values!(self, column, min, min_bytes)
     }
 
     fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+        if is_min_max_deprecated!(self, column) {
+            // use deprecated min/max values only when min == max
+            let min_values = get_min_max_values!(self, column, min, min_bytes);
+            let max_values = get_min_max_values!(self, column, max, max_bytes);
+            if min_values == max_values {
+                return max_values;
+            }
+            return None;
+        }
         get_min_max_values!(self, column, max, max_bytes)
     }
 
@@ -240,6 +311,38 @@ impl<'a> PruningStatistics for RowGroupPruningStatistics<'a> {
 
     fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
         get_null_count_values!(self, column)
+    }
+
+    fn dictionary_values(&self, column: &Column) -> Option<ArrayRef> {
+        if !self.use_dictionary_filtering {
+            return None;
+        }
+        let col_idx = self
+            .row_group_metadata
+            .columns()
+            .iter()
+            .position(|c| c.column_path().string().eq_ignore_ascii_case(&column.flat_name()))?;
+
+        self.cached_dictionaries[col_idx].get_or_init(|| {
+            let dict_values = match futures::executor::block_on(async move {
+                parquet::blaze::get_dictionary_for_pruning(
+                    &mut self.input.borrow_mut().0,
+                    self.parquet_metadata,
+                    self.row_group_idx,
+                    col_idx,
+                ).await
+            }) {
+                Ok(Some(dict_values)) => dict_values,
+                _ => return None,
+            };
+            let dict_array = ListArray::try_new(
+                Arc::new(Field::new("items", dict_values.data_type().clone(), false)),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0, dict_values.len() as i32])),
+                dict_values,
+                None,
+            ).ok()?;
+            Some(Arc::new(dict_array))
+        }).as_ref().cloned()
     }
 }
 

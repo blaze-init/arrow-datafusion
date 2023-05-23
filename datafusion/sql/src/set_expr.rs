@@ -38,12 +38,6 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 let all = match set_quantifier {
                     SetQuantifier::All => true,
                     SetQuantifier::Distinct | SetQuantifier::None => false,
-                    SetQuantifier::ByName => {
-                        return not_impl_err!("UNION BY NAME not implemented");
-                    }
-                    SetQuantifier::AllByName => {
-                        return not_impl_err!("UNION ALL BY NAME not implemented")
-                    }
                 };
 
                 let left_plan = self.set_expr_to_plan(*left, planner_context)?;

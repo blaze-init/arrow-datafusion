@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::intervals::Interval;
-use crate::utils::scatter;
+pub use crate::utils::scatter;
 
 use arrow::array::BooleanArray;
 use arrow::compute::filter_record_batch;

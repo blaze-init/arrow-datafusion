@@ -27,11 +27,12 @@ use std::{convert::TryFrom, fmt, iter::repeat, sync::Arc};
 
 use crate::cast::{
     as_decimal128_array, as_decimal256_array, as_dictionary_array,
-    as_fixed_size_binary_array, as_fixed_size_list_array, as_list_array, as_struct_array,
+    as_fixed_size_binary_array, as_fixed_size_list_array, as_list_array,
+    as_map_array, as_struct_array,
 };
 use crate::delta::shift_months;
 use crate::error::{DataFusionError, Result, _internal_err, _not_impl_err};
-use arrow::buffer::NullBuffer;
+use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::compute::nullif;
 use arrow::datatypes::{i256, FieldRef, Fields, SchemaBuilder};
 use arrow::{
@@ -147,6 +148,8 @@ pub enum ScalarValue {
     DurationNanosecond(Option<i64>),
     /// struct of nested ScalarValue
     Struct(Option<Vec<ScalarValue>>, Fields),
+    /// map of nested ScalarValue, represented as struct<key, value>
+    Map(Box<ScalarValue>, bool),
     /// Dictionary type: index type and value
     Dictionary(Box<DataType>, Box<ScalarValue>),
 }
@@ -211,6 +214,8 @@ impl PartialEq for ScalarValue {
             (Fixedsizelist(_, _, _), _) => false,
             (List(v1, t1), List(v2, t2)) => v1.eq(v2) && t1.eq(t2),
             (List(_, _), _) => false,
+            (Map(v1, s1), Map(v2, s2)) => v1.eq(v2) && s1.eq(s2),
+            (Map(_, _), _) => false,
             (Date32(v1), Date32(v2)) => v1.eq(v2),
             (Date32(_), _) => false,
             (Date64(v1), Date64(v2)) => v1.eq(v2),
@@ -353,6 +358,14 @@ impl PartialOrd for ScalarValue {
                 }
             }
             (List(_, _), _) => None,
+            (Map(v1, s1), Map(v2, s2)) => {
+                if s1.eq(s2) {
+                    v1.partial_cmp(v2)
+                } else {
+                    None
+                }
+            }
+            (Map(_, _), _) => None,
             (Date32(v1), Date32(v2)) => v1.partial_cmp(v2),
             (Date32(_), _) => None,
             (Date64(v1), Date64(v2)) => v1.partial_cmp(v2),
@@ -1489,6 +1502,7 @@ impl std::hash::Hash for ScalarValue {
                 v.hash(state);
                 t.hash(state);
             }
+            Map(v, s) => (v, s).hash(state),
             Date32(v) => v.hash(state),
             Date64(v) => v.hash(state),
             Time32Second(v) => v.hash(state),
@@ -2002,6 +2016,16 @@ impl ScalarValue {
                 field.data_type().clone(),
                 true,
             ))),
+            ScalarValue::Map(v, s) => {
+                if let ScalarValue::Struct(_, fields) = v.as_ref() {
+                    DataType::Map(
+                        Arc::new(Field::new("entries", DataType::Struct(fields.clone()), true)),
+                        *s,
+                    )
+                } else {
+                    panic!("ScalarValue::Map inner value must be struct<key, value>")
+                }
+            },
             ScalarValue::Date32(_) => DataType::Date32,
             ScalarValue::Date64(_) => DataType::Date64,
             ScalarValue::Time32Second(_) => DataType::Time32(TimeUnit::Second),
@@ -2155,6 +2179,7 @@ impl ScalarValue {
             ScalarValue::LargeBinary(v) => v.is_none(),
             ScalarValue::Fixedsizelist(v, ..) => v.is_none(),
             ScalarValue::List(v, _) => v.is_none(),
+            ScalarValue::Map(v, _) => v.is_null(),
             ScalarValue::Date32(v) => v.is_none(),
             ScalarValue::Date64(v) => v.is_none(),
             ScalarValue::Time32Second(v) => v.is_none(),
@@ -2928,6 +2953,20 @@ impl ScalarValue {
                 )
                 .unwrap(),
             }),
+            ScalarValue::Map(v, sorted) => {
+                let inner_array = v.to_array_of_size(size);
+                let inner_struct = as_struct_array(&inner_array)
+                    .expect("ScalarValue::Map inner array data type must be struct<key, value>");
+                let inner_data = inner_struct.to_data();
+
+                Arc::new(MapArray::new(
+                    Arc::new(Field::new("entries", inner_struct.data_type().clone(), true)),
+                    OffsetBuffer::new(ScalarBuffer::<i32>::from(inner_data.buffers()[0].clone())),
+                    inner_struct.clone(),
+                    inner_data.nulls().cloned(),
+                    *sorted,
+                ))
+            }
             ScalarValue::Date32(e) => {
                 build_array_from_option!(Date32, Date32Array, e, size)
             }
@@ -3132,6 +3171,12 @@ impl ScalarValue {
                     }
                 };
                 ScalarValue::new_list(value, nested_type.data_type().clone())
+            }
+            DataType::Map(_field, sorted) => {
+                let array = as_map_array(array)?;
+                let inner_struct = array.value(index);
+                let inner_scalar = ScalarValue::try_from_array(&inner_struct, 0)?;
+                ScalarValue::Map(Box::new(inner_scalar), *sorted)
             }
             DataType::Date32 => {
                 typed_cast!(array, index, Date32Array, Date32)
@@ -3410,6 +3455,7 @@ impl ScalarValue {
             }
             ScalarValue::Fixedsizelist(..) => unimplemented!(),
             ScalarValue::List(_, _) => unimplemented!(),
+            ScalarValue::Map(_, _) => unimplemented!(),
             ScalarValue::Date32(val) => {
                 eq_array_primitive!(array, index, Date32Array, val)
             }
@@ -3538,6 +3584,7 @@ impl ScalarValue {
                         // `field` is boxed, so it is NOT already included in `self`
                         + field.size()
                 }
+                ScalarValue::Map(v, _) => v.size() + 1,
                 ScalarValue::Struct(vals, fields) => {
                     vals.as_ref()
                         .map(|vals| {
@@ -3907,6 +3954,11 @@ impl fmt::Display for ScalarValue {
                 )?,
                 None => write!(f, "NULL")?,
             },
+            ScalarValue::Map(v, s) => if !v.is_null() {
+                write!(f, "Map({v}, {s})")?
+            } else {
+                write!(f, "NULL")?
+            },
             ScalarValue::Date32(e) => format_option!(f, e)?,
             ScalarValue::Date64(e) => format_option!(f, e)?,
             ScalarValue::Time32Second(e) => format_option!(f, e)?,
@@ -3983,6 +4035,7 @@ impl fmt::Debug for ScalarValue {
             ScalarValue::LargeBinary(Some(_)) => write!(f, "LargeBinary(\"{self}\")"),
             ScalarValue::Fixedsizelist(..) => write!(f, "FixedSizeList([{self}])"),
             ScalarValue::List(_, _) => write!(f, "List([{self}])"),
+            ScalarValue::Map(_, _) => write!(f, "Map([{self}])"),
             ScalarValue::Date32(_) => write!(f, "Date32(\"{self}\")"),
             ScalarValue::Date64(_) => write!(f, "Date64(\"{self}\")"),
             ScalarValue::Time32Second(_) => write!(f, "Time32Second(\"{self}\")"),
