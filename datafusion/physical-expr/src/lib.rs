@@ -60,7 +60,7 @@ pub use equivalence::{
     OrderingEquivalenceProperties, OrderingEquivalentClass,
 };
 pub use partitioning::{Distribution, Partitioning};
-pub use physical_expr::{PhysicalExpr, PhysicalExprRef};
+pub use physical_expr::{PhysicalExpr, PhysicalExprRef, scatter};
 pub use planner::create_physical_expr;
 pub use scalar_function::ScalarFunctionExpr;
 pub use sort_expr::{

@@ -2289,7 +2289,7 @@ mod roundtrip_tests {
                         Field::new("keys", DataType::Utf8, false),
                         Field::new("values", DataType::Int32, true),
                     ])),
-                    true,
+                    false,
                 ),
                 false,
             ),
