@@ -36,6 +36,7 @@ use datafusion_expr::{field_util::GetFieldAccessSchema, ColumnarValue};
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::{any::Any, sync::Arc};
+use arrow_array::BooleanArray;
 
 /// Access a sub field of a nested type, such as `Field` or `List`
 #[derive(Clone, Hash, Debug)]
@@ -195,6 +196,91 @@ impl GetIndexedFieldExpr {
             },
         })
     }
+    fn evaluate_impl(
+        &self,
+        batch: &RecordBatch,
+        filter: Option<&BooleanArray>,
+    ) -> Result<ColumnarValue> {
+
+        let (num_rows, array) =
+            match self.arg.evaluate_with_filter_optional(batch, filter)? {
+                ColumnarValue::Array(array) => (array.len(), array),
+                ColumnarValue::Scalar(scalar) => {
+                    let num_rows = filter
+                        .map(|filter| filter.true_count())
+                        .unwrap_or(batch.num_rows());
+                    (num_rows, scalar.to_array_of_size(num_rows)?)
+                }
+            };
+
+        match &self.field {
+            GetFieldAccessExpr::NamedStructField{name} => match (array.data_type(), name) {
+                (DataType::Map(_, _), ScalarValue::Utf8(Some(k))) => {
+                    let map_array = as_map_array(array.as_ref())?;
+                    let key_scalar = Scalar::new(StringArray::from(vec![k.clone()]));
+                    let keys = arrow::compute::kernels::cmp::eq(&key_scalar, map_array.keys())?;
+                    let entries = arrow::compute::filter(map_array.entries(), &keys)?;
+                    let entries_struct_array = as_struct_array(entries.as_ref())?;
+                    Ok(ColumnarValue::Array(entries_struct_array.column(1).clone()))
+                }
+                (DataType::Struct(_), ScalarValue::Utf8(Some(k))) => {
+                    let as_struct_array = as_struct_array(&array)?;
+                    match as_struct_array.column_by_name(k) {
+                        None => exec_err!(
+                            "get indexed field {k} not found in struct"),
+                        Some(col) => Ok(ColumnarValue::Array(col.clone()))
+                    }
+                }
+                (DataType::Struct(_), name) => exec_err!(
+                    "get indexed field is only possible on struct with utf8 indexes. \
+                             Tried with {name:?} index"),
+                (dt, name) => exec_err!(
+                                "get indexed field is only possible on lists with int64 indexes or struct \
+                                         with utf8 indexes. Tried {dt:?} with {name:?} index"),
+            },
+            GetFieldAccessExpr::ListIndex{key} => {
+                let key = key
+                    .evaluate_with_filter_optional(batch, filter)?
+                    .into_array(num_rows)?;
+                match (array.data_type(), key.data_type()) {
+                    (DataType::List(_), DataType::Int64) => Ok(ColumnarValue::Array(array_element(&[
+                        array, key
+                    ])?)),
+                    (DataType::List(_), key) => exec_err!(
+                                "get indexed field is only possible on lists with int64 indexes. \
+                                    Tried with {key:?} index"),
+                    (dt, key) => exec_err!(
+                                        "get indexed field is only possible on lists with int64 indexes or struct \
+                                                 with utf8 indexes. Tried {dt:?} with {key:?} index"),
+                }
+            },
+            GetFieldAccessExpr::ListRange { start, stop, stride } => {
+                let start = start
+                    .evaluate_with_filter_optional(batch, filter)?
+                    .into_array(num_rows)?;
+                let stop = stop
+                    .evaluate_with_filter_optional(batch, filter)?
+                    .into_array(num_rows)?;
+                let stride = stride
+                    .evaluate_with_filter_optional(batch, filter)?
+                    .into_array(num_rows)?;
+                match (array.data_type(), start.data_type(), stop.data_type(), stride.data_type()) {
+                    (DataType::List(_), DataType::Int64, DataType::Int64, DataType::Int64) => {
+                        Ok(ColumnarValue::Array((array_slice(&[
+                            array, start, stop, stride
+                        ]))?))
+                    },
+                    (DataType::List(_), start, stop, stride) => exec_err!(
+                        "get indexed field is only possible on lists with int64 indexes. \
+                                 Tried with {start:?}, {stop:?} and {stride:?} indices"),
+                    (dt, start, stop, stride) => exec_err!(
+                        "get indexed field is only possible on lists with int64 indexes or struct \
+                                 with utf8 indexes. Tried {dt:?} with {start:?}, {stop:?} and {stride:?} indices"),
+                }
+            }
+        }
+    }
+
 }
 
 impl std::fmt::Display for GetIndexedFieldExpr {
@@ -223,65 +309,11 @@ impl PhysicalExpr for GetIndexedFieldExpr {
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        let array = self.arg.evaluate(batch)?.into_array(batch.num_rows())?;
-        match &self.field {
-            GetFieldAccessExpr::NamedStructField{name} => match (array.data_type(), name) {
-                (DataType::Map(_, _), ScalarValue::Utf8(Some(k))) => {
-                    let map_array = as_map_array(array.as_ref())?;
-                    let key_scalar = Scalar::new(StringArray::from(vec![k.clone()]));
-                    let keys = arrow::compute::kernels::cmp::eq(&key_scalar, map_array.keys())?;
-                    let entries = arrow::compute::filter(map_array.entries(), &keys)?;
-                    let entries_struct_array = as_struct_array(entries.as_ref())?;
-                    Ok(ColumnarValue::Array(entries_struct_array.column(1).clone()))
-                }
-                (DataType::Struct(_), ScalarValue::Utf8(Some(k))) => {
-                    let as_struct_array = as_struct_array(&array)?;
-                    match as_struct_array.column_by_name(k) {
-                        None => exec_err!(
-                            "get indexed field {k} not found in struct"),
-                        Some(col) => Ok(ColumnarValue::Array(col.clone()))
-                    }
-                }
-                (DataType::Struct(_), name) => exec_err!(
-                    "get indexed field is only possible on struct with utf8 indexes. \
-                             Tried with {name:?} index"),
-                (dt, name) => exec_err!(
-                                "get indexed field is only possible on lists with int64 indexes or struct \
-                                         with utf8 indexes. Tried {dt:?} with {name:?} index"),
-            },
-            GetFieldAccessExpr::ListIndex{key} => {
-            let key = key.evaluate(batch)?.into_array(batch.num_rows())?;
-            match (array.data_type(), key.data_type()) {
-                (DataType::List(_), DataType::Int64) => Ok(ColumnarValue::Array(array_element(&[
-                    array, key
-                ])?)),
-                (DataType::List(_), key) => exec_err!(
-                                "get indexed field is only possible on lists with int64 indexes. \
-                                    Tried with {key:?} index"),
-                            (dt, key) => exec_err!(
-                                        "get indexed field is only possible on lists with int64 indexes or struct \
-                                                 with utf8 indexes. Tried {dt:?} with {key:?} index"),
-                        }
-                },
-            GetFieldAccessExpr::ListRange { start, stop, stride } => {
-                let start = start.evaluate(batch)?.into_array(batch.num_rows())?;
-                let stop = stop.evaluate(batch)?.into_array(batch.num_rows())?;
-                let stride = stride.evaluate(batch)?.into_array(batch.num_rows())?;
-                match (array.data_type(), start.data_type(), stop.data_type(), stride.data_type()) {
-                    (DataType::List(_), DataType::Int64, DataType::Int64, DataType::Int64) => {
-                        Ok(ColumnarValue::Array((array_slice(&[
-                            array, start, stop, stride
-                        ]))?))
-                    },
-                    (DataType::List(_), start, stop, stride) => exec_err!(
-                        "get indexed field is only possible on lists with int64 indexes. \
-                                 Tried with {start:?}, {stop:?} and {stride:?} indices"),
-                    (dt, start, stop, stride) => exec_err!(
-                        "get indexed field is only possible on lists with int64 indexes or struct \
-                                 with utf8 indexes. Tried {dt:?} with {start:?}, {stop:?} and {stride:?} indices"),
-                }
-            }
-        }
+        self.evaluate_impl(batch, None)
+    }
+
+    fn evaluate_with_filter(&self, batch: &RecordBatch, filter: &BooleanArray) -> Result<ColumnarValue> {
+        self.evaluate_impl(batch, Some(filter))
     }
 
     fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {

@@ -257,61 +257,15 @@ impl PhysicalExpr for BinaryExpr {
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        use arrow::compute::kernels::numeric::*;
+        self.evaluate_impl(batch, None)
+    }
 
-        let lhs = self.left.evaluate(batch)?;
-        let rhs = self.right.evaluate(batch)?;
-        let left_data_type = lhs.data_type();
-        let right_data_type = rhs.data_type();
-
-        let schema = batch.schema();
-        let input_schema = schema.as_ref();
-
-        match self.op {
-            Operator::Plus => return apply(&lhs, &rhs, add_wrapping),
-            Operator::Minus => return apply(&lhs, &rhs, sub_wrapping),
-            Operator::Multiply => return apply(&lhs, &rhs, mul_wrapping),
-            Operator::Divide => return apply(&lhs, &rhs, div),
-            Operator::Modulo => return apply(&lhs, &rhs, rem),
-            Operator::Eq => return apply_cmp(&lhs, &rhs, eq),
-            Operator::NotEq => return apply_cmp(&lhs, &rhs, neq),
-            Operator::Lt => return apply_cmp(&lhs, &rhs, lt),
-            Operator::Gt => return apply_cmp(&lhs, &rhs, gt),
-            Operator::LtEq => return apply_cmp(&lhs, &rhs, lt_eq),
-            Operator::GtEq => return apply_cmp(&lhs, &rhs, gt_eq),
-            Operator::IsDistinctFrom => return apply_cmp(&lhs, &rhs, distinct),
-            Operator::IsNotDistinctFrom => return apply_cmp(&lhs, &rhs, not_distinct),
-            Operator::LikeMatch => return apply_cmp(&lhs, &rhs, like),
-            Operator::ILikeMatch => return apply_cmp(&lhs, &rhs, ilike),
-            Operator::NotLikeMatch => return apply_cmp(&lhs, &rhs, nlike),
-            Operator::NotILikeMatch => return apply_cmp(&lhs, &rhs, nilike),
-            _ => {}
-        }
-
-        let result_type = self.data_type(input_schema)?;
-
-        // Attempt to use special kernels if one input is scalar and the other is an array
-        let scalar_result = match (&lhs, &rhs) {
-            (ColumnarValue::Array(array), ColumnarValue::Scalar(scalar)) => {
-                // if left is array and right is literal - use scalar operations
-                self.evaluate_array_scalar(array, scalar.clone())?.map(|r| {
-                    r.and_then(|a| to_result_type_array(&self.op, a, &result_type))
-                })
-            }
-            (_, _) => None, // default to array implementation
-        };
-
-        if let Some(result) = scalar_result {
-            return result.map(ColumnarValue::Array);
-        }
-
-        // if both arrays or both literals - extract arrays and continue execution
-        let (left, right) = (
-            lhs.into_array(batch.num_rows())?,
-            rhs.into_array(batch.num_rows())?,
-        );
-        self.evaluate_with_resolved_args(left, &left_data_type, right, &right_data_type)
-            .map(ColumnarValue::Array)
+    fn evaluate_with_filter(
+        &self,
+        batch: &RecordBatch,
+        filter: &BooleanArray,
+    ) -> Result<ColumnarValue> {
+        self.evaluate_impl(batch, Some(filter))
     }
 
     fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
@@ -606,6 +560,76 @@ impl BinaryExpr {
             ArrowAt => array_has_all(&[right, left]),
         }
     }
+
+    fn evaluate_impl(
+        &self,
+        batch: &RecordBatch,
+        filter: Option<&BooleanArray>,
+    ) -> Result<ColumnarValue> {
+        use arrow::compute::kernels::numeric::*;
+
+        let lhs = self.left.evaluate_with_filter_optional(batch, filter)?;
+        let rhs = self.right.evaluate_with_filter_optional(batch, filter)?;
+        let num_rows = match (&lhs, &rhs) {
+            (ColumnarValue::Array(array), _) | (_, ColumnarValue::Array(array)) => {
+                array.len()
+            }
+            _ => filter.map(|filter| filter.len()).unwrap_or(batch.num_rows()),
+        };
+
+        let left_data_type = lhs.data_type();
+        let right_data_type = rhs.data_type();
+
+        let schema = batch.schema();
+        let input_schema = schema.as_ref();
+
+        match self.op {
+            Operator::Plus => return apply(&lhs, &rhs, add_wrapping),
+            Operator::Minus => return apply(&lhs, &rhs, sub_wrapping),
+            Operator::Multiply => return apply(&lhs, &rhs, mul_wrapping),
+            Operator::Divide => return apply(&lhs, &rhs, div),
+            Operator::Modulo => return apply(&lhs, &rhs, rem),
+            Operator::Eq => return apply_cmp(&lhs, &rhs, eq),
+            Operator::NotEq => return apply_cmp(&lhs, &rhs, neq),
+            Operator::Lt => return apply_cmp(&lhs, &rhs, lt),
+            Operator::Gt => return apply_cmp(&lhs, &rhs, gt),
+            Operator::LtEq => return apply_cmp(&lhs, &rhs, lt_eq),
+            Operator::GtEq => return apply_cmp(&lhs, &rhs, gt_eq),
+            Operator::IsDistinctFrom => return apply_cmp(&lhs, &rhs, distinct),
+            Operator::IsNotDistinctFrom => return apply_cmp(&lhs, &rhs, not_distinct),
+            Operator::LikeMatch => return apply_cmp(&lhs, &rhs, like),
+            Operator::ILikeMatch => return apply_cmp(&lhs, &rhs, ilike),
+            Operator::NotLikeMatch => return apply_cmp(&lhs, &rhs, nlike),
+            Operator::NotILikeMatch => return apply_cmp(&lhs, &rhs, nilike),
+            _ => {}
+        }
+
+        let result_type = self.data_type(input_schema)?;
+
+        // Attempt to use special kernels if one input is scalar and the other is an array
+        let scalar_result = match (&lhs, &rhs) {
+            (ColumnarValue::Array(array), ColumnarValue::Scalar(scalar)) => {
+                // if left is array and right is literal - use scalar operations
+                self.evaluate_array_scalar(array, scalar.clone())?.map(|r| {
+                    r.and_then(|a| to_result_type_array(&self.op, a, &result_type))
+                })
+            }
+            (_, _) => None, // default to array implementation
+        };
+
+        if let Some(result) = scalar_result {
+            return result.map(ColumnarValue::Array);
+        }
+
+        // if both arrays or both literals - extract arrays and continue execution
+        let (left, right) = (
+            lhs.into_array(num_rows)?,
+            rhs.into_array(num_rows)?,
+        );
+        self.evaluate_with_resolved_args(left, &left_data_type, right, &right_data_type)
+            .map(ColumnarValue::Array)
+    }
+
 }
 
 /// Create a binary expression whose arguments are correctly coerced.

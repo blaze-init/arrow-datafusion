@@ -28,6 +28,7 @@ use arrow::{
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
+use arrow_array::BooleanArray;
 use datafusion_common::{internal_err, DataFusionError, Result};
 use datafusion_expr::ColumnarValue;
 
@@ -91,6 +92,16 @@ impl PhysicalExpr for Column {
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
         self.bounds_check(batch.schema().as_ref())?;
         Ok(ColumnarValue::Array(batch.column(self.index).clone()))
+    }
+
+    fn evaluate_with_filter(
+        &self, batch: &RecordBatch,
+        filter: &BooleanArray,
+    ) -> Result<ColumnarValue> {
+        self.bounds_check(batch.schema().as_ref())?;
+        Ok(ColumnarValue::Array(
+            arrow::compute::filter(batch.column(self.index), filter)?
+        ))
     }
 
     fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
@@ -176,6 +187,14 @@ impl PhysicalExpr for UnKnownColumn {
     /// Evaluate the expression
     fn evaluate(&self, _batch: &RecordBatch) -> Result<ColumnarValue> {
         internal_err!("UnKnownColumn::evaluate() should not be called")
+    }
+
+    fn evaluate_with_filter(
+        &self,
+        _batch: &RecordBatch,
+        _filter: &BooleanArray,
+    ) -> Result<ColumnarValue> {
+        internal_err!("UnKnownColumn::evaluate_with_filter() should not be called")
     }
 
     fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {

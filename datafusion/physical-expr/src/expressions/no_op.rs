@@ -25,6 +25,7 @@ use arrow::{
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
+use arrow_array::BooleanArray;
 
 use crate::physical_expr::down_cast_any_ref;
 use crate::PhysicalExpr;
@@ -66,6 +67,10 @@ impl PhysicalExpr for NoOp {
 
     fn evaluate(&self, _batch: &RecordBatch) -> Result<ColumnarValue> {
         internal_err!("NoOp::evaluate() should not be called")
+    }
+
+    fn evaluate_with_filter(&self, _batch: &RecordBatch, _filter: &BooleanArray) -> Result<ColumnarValue> {
+        internal_err!("NoOp::evaluate_with_filter() should not be called")
     }
 
     fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {

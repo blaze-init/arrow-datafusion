@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::{any::Any, sync::Arc};
 
-use crate::expressions::{Literal, try_cast};
+use crate::expressions::try_cast;
 use crate::expressions::NoOp;
 use crate::physical_expr::down_cast_any_ref;
 use crate::PhysicalExpr;
@@ -122,29 +121,28 @@ impl CaseExpr {
     ///     [WHEN ...]
     ///     [ELSE result]
     /// END
-    fn case_when_with_expr(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+    fn case_when_with_expr(&self, batch: &RecordBatch, filter: Option<&BooleanArray>) -> Result<ColumnarValue> {
         let return_type = self.data_type(&batch.schema())?;
         let expr = self.expr.as_ref().unwrap();
-        let base_value = expr.evaluate(batch)?;
-        let base_value = base_value.into_array(batch.num_rows())?;
+        let base_value = expr.evaluate_selection_optional(batch, filter)?
+            .into_array(batch.num_rows())?;
         let base_nulls = is_null(base_value.as_ref())?;
 
         // start with nulls as default output
         let mut current_value = new_null_array(&return_type, batch.num_rows());
         // We only consider non-null values while comparing with whens
         let mut remainder = not(&base_nulls)?;
-        for i in 0..self.when_then_expr.len() {
-            let when_value = self.when_then_expr[i]
-                .0
-                .evaluate_selection(batch, &remainder)?;
-            let when_value = when_value.into_array(batch.num_rows())?;
-            // build boolean array representing which rows match the "when" value
-            let when_match = eq(&when_value, &base_value)?;
+        for (when_expr, then_expr) in &self.when_then_expr {
+            let when_value = when_expr.evaluate_selection_optional(batch, filter)?
+                .into_array(batch.num_rows())?;
+
+            // Build boolean array representing which rows match the "when" value
             // Treat nulls as false
-            let when_match = match when_match.null_count() {
-                0 => Cow::Borrowed(&when_match),
-                _ => Cow::Owned(prep_null_mask_filter(&when_match)),
+            let when_match = match eq(&when_value, &base_value)? {
+                wm if wm.null_count() > 0 => prep_null_mask_filter(&wm),
+                wm => wm,
             };
+
             // Make sure we only consider rows that have not been matched yet
             let when_match = and(&when_match, &remainder)?;
 
@@ -153,11 +151,7 @@ impl CaseExpr {
                 continue;
             }
 
-            let then_value = self.when_then_expr[i]
-                .1
-                .evaluate_selection(batch, &when_match)?;
-
-            current_value = match then_value {
+            current_value = match then_expr.evaluate_selection(batch, &when_match)? {
                 ColumnarValue::Scalar(ScalarValue::Null) => {
                     nullif(current_value.as_ref(), &when_match)?
                 }
@@ -178,12 +172,14 @@ impl CaseExpr {
                 .unwrap_or_else(|_| e.clone());
             // null and unmatched tuples should be assigned else value
             remainder = or(&base_nulls, &remainder)?;
-            let else_ = expr
-                .evaluate_selection(batch, &remainder)?
-                .into_array(batch.num_rows())?;
+            let else_ = expr.evaluate_selection(batch, &remainder)?.into_array(remainder.len())?;
             current_value = zip(&remainder, &else_, &current_value)?;
         }
 
+        let current_value = match filter {
+            Some(filter) => arrow::compute::filter(&current_value, filter)?,
+            None => current_value,
+        };
         Ok(ColumnarValue::Array(current_value))
     }
 
@@ -194,42 +190,54 @@ impl CaseExpr {
     ///      [WHEN ...]
     ///      [ELSE result]
     /// END
-    fn case_when_no_expr(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+    fn case_when_no_expr(
+        &self,
+        batch: &RecordBatch,
+        filter: Option<&BooleanArray>,
+    ) -> Result<ColumnarValue> {
         let return_type = self.data_type(&batch.schema())?;
 
         // start with nulls as default output
         let mut current_value = new_null_array(&return_type, batch.num_rows());
-        let mut remainder = None; // BooleanArray::from(vec![true; batch.num_rows()]);
-        for i in 0..self.when_then_expr.len() {
+        let mut remainder = None;
+        for (when_expr, then_expr) in &self.when_then_expr {
             let when_value = match &remainder {
-                None => self.when_then_expr[i].0.evaluate(batch)?,
-                Some(remainder) => self.when_then_expr[i]
-                    .0
-                    .evaluate_selection(batch, remainder)?,
+                None => when_expr.evaluate_selection_optional(batch, filter)?,
+                Some(remainder) => {
+                    match filter {
+                        Some(filter) => {
+                            when_expr.evaluate_selection(batch, &and(filter, remainder)?)?
+                        }
+                        None => {
+                            when_expr.evaluate_selection(batch, remainder)?
+                        }
+                    }
+                }
+            };
+            if matches!(&when_value, ColumnarValue::Scalar(v) if v.is_null()) {
+                continue;
+            }
+            if matches!(&when_value, ColumnarValue::Scalar(v) if v == &ScalarValue::from(false)) {
+                continue;
+            }
+
+            let when_value = match as_boolean_array(
+                &when_value.clone().into_array(batch.num_rows())?
+            ) {
+                Ok(wv) if wv.null_count() > 0 => prep_null_mask_filter(wv),
+                Ok(wv) => wv.clone(),
+                Err(_) => {
+                    let wvdt = when_value.data_type();
+                    return Err(DataFusionError::Internal(
+                        format!("When expression did not return a BooleanArray: {wvdt}"),
+                    ))
+                }
             };
 
-            let when_value = match when_value {
-                ColumnarValue::Scalar(value) if value.is_null() => {
-                    continue;
-                }
-                _ => when_value,
-            };
-            let when_value = when_value.into_array(batch.num_rows())?;
-            let when_value = as_boolean_array(&when_value).map_err(|e| {
-                DataFusionError::Context(
-                    "WHEN expression did not return a BooleanArray".to_string(),
-                    Box::new(e),
-                )
-            })?;
-            // Treat 'NULL' as false value
-            let when_value = match when_value.null_count() {
-                0 => Cow::Borrowed(when_value),
-                _ => Cow::Owned(prep_null_mask_filter(when_value)),
-            };
             // Make sure we only consider rows that have not been matched yet
             let when_value = match &remainder {
+                Some(remainder) => and(&when_value, remainder)?,
                 None => when_value,
-                Some(remainder) => Cow::Owned(and(&when_value, remainder)?),
             };
 
             // When no rows available for when clause, skip then clause
@@ -237,11 +245,7 @@ impl CaseExpr {
                 continue;
             }
 
-            let then_value = self.when_then_expr[i]
-                .1
-                .evaluate_selection(batch, &when_value)?;
-
-            current_value = match then_value {
+            current_value = match then_expr.evaluate_selection(batch, &when_value)? {
                 ColumnarValue::Scalar(ScalarValue::Null) => {
                     nullif(current_value.as_ref(), &when_value)?
                 }
@@ -267,30 +271,22 @@ impl CaseExpr {
                 .unwrap_or_else(|_| e.clone());
             match &remainder {
                 Some(remainder) => {
-                    let else_ = expr
-                        .evaluate_selection(batch, &remainder)?
+                    let else_ = &expr.evaluate_selection(batch, &remainder)?
                         .into_array(batch.num_rows())?;
                     current_value = zip(&remainder, &else_, &current_value)?;
                 }
                 None => {
-                    let else_ = expr.evaluate(batch)?.into_array(batch.num_rows())?;
+                    let else_ = &expr.evaluate_selection_optional(batch, filter)?
+                        .into_array(batch.num_rows())?;
                     current_value = else_.clone();
                 }
             };
         }
+        let current_value = match filter {
+            Some(filter) => arrow::compute::filter(&current_value, filter)?,
+            None => current_value,
+        };
         Ok(ColumnarValue::Array(current_value))
-    }
-
-    fn is_else_null(&self) -> bool {
-        match &self.else_expr {
-            Some(expr) => {
-                match expr.as_any().downcast_ref::<Literal>() {
-                    Some(lit) => lit.value().is_null(),
-                    None => false,
-                }
-            }
-            None => true,
-        }
     }
 }
 
@@ -342,11 +338,28 @@ impl PhysicalExpr for CaseExpr {
         if self.expr.is_some() {
             // this use case evaluates "expr" and then compares the values with the "when"
             // values
-            self.case_when_with_expr(batch)
+            self.case_when_with_expr(batch , None)
         } else {
             // The "when" conditions all evaluate to boolean in this use case and can be
             // arbitrary expressions
-            self.case_when_no_expr(batch)
+            self.case_when_no_expr(batch, None)
+        }
+    }
+
+    fn evaluate_with_filter(
+        &self,
+        batch: &RecordBatch,
+        filter: &BooleanArray,
+    ) -> Result<ColumnarValue> {
+
+        if self.expr.is_some() {
+            // this use case evaluates "expr" and then compares the values with the "when"
+            // values
+            self.case_when_with_expr(batch, Some(filter))
+        } else {
+            // The "when" conditions all evaluate to boolean in this use case and can be
+            // arbitrary expressions
+            self.case_when_no_expr(batch, Some(filter))
         }
     }
 
@@ -490,6 +503,16 @@ mod tests {
 
         assert_eq!(expected, result);
 
+        // test evaluate with filter
+        let result = expr
+            .evaluate_with_filter(&batch, &vec![true, false, true, true].into())?
+            .into_array(3)
+            .expect("Failed to convert to array");
+        let result = as_int32_array(&result)?;
+
+        let expected = &Int32Array::from(vec![Some(123), None, Some(456)]);
+
+        assert_eq!(expected, result);
         Ok(())
     }
 
@@ -522,6 +545,17 @@ mod tests {
 
         assert_eq!(expected, result);
 
+        // test evaluate_with_filter
+        let result = expr
+            .evaluate_with_filter(&batch, &vec![true, true, false, true].into())?
+            .into_array(3)
+            .expect("Failed to convert to array");
+        let result = as_int32_array(&result)?;
+
+        let expected =
+            &Int32Array::from(vec![Some(123), Some(999), Some(456)]);
+
+        assert_eq!(expected, result);
         Ok(())
     }
 
@@ -594,6 +628,17 @@ mod tests {
         let result = as_int32_array(&result)?;
 
         let expected = &Int32Array::from(vec![Some(123), None, None, Some(456)]);
+
+        assert_eq!(expected, result);
+
+        // test evaluate_with_filter
+        let result = expr
+            .evaluate_with_filter(&batch, &vec![true, false, true, true].into())?
+            .into_array(3)
+            .expect("Failed to convert to array");
+        let result = as_int32_array(&result)?;
+
+        let expected = &Int32Array::from(vec![Some(123), None, Some(456)]);
 
         assert_eq!(expected, result);
 
@@ -713,6 +758,16 @@ mod tests {
 
         assert_eq!(expected, result);
 
+        // test evaluate_with_filter
+        let result = expr
+            .evaluate_with_filter(&batch, &vec![true, false, true, true].into())?
+            .into_array(3)
+            .expect("Failed to convert to array");
+        let result = as_int32_array(&result)?;
+
+        let expected = &Int32Array::from(vec![Some(123), Some(999), Some(456)]);
+
+        assert_eq!(expected, result);
         Ok(())
     }
 

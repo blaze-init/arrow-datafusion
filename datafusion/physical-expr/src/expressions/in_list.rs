@@ -113,6 +113,7 @@ where
             _ => {}
         }
 
+        assert_eq!(v.data_type(), self.array.data_type());
         let v = v.as_any().downcast_ref::<T>().unwrap();
         let in_array = &self.array;
         let has_nulls = in_array.null_count() != 0;
@@ -303,6 +304,46 @@ impl InListExpr {
     pub fn negated(&self) -> bool {
         self.negated
     }
+
+    fn evaluate_impl(
+        &self,
+        batch: &RecordBatch,
+        filter: Option<&BooleanArray>,
+    ) -> Result<ColumnarValue> {
+        let value = self.expr.evaluate_with_filter_optional(batch, filter)?;
+        let num_rows = match &value {
+            ColumnarValue::Array(array) => array.len(),
+            ColumnarValue::Scalar(_) => filter
+                .map(|filter| filter.true_count())
+                .unwrap_or(batch.num_rows()),
+        };
+
+        let r = match &self.static_filter {
+            Some(f) => f.contains(value.into_array(num_rows)?.as_ref(), self.negated)?,
+            None => {
+                let value = value.into_array(num_rows)?;
+                let found = self.list
+                    .iter()
+                    .map(|expr| expr.evaluate_with_filter_optional(batch, filter))
+                    .try_fold(
+                        BooleanArray::new(BooleanBuffer::new_unset(num_rows), None),
+                        |result, expr| -> Result<BooleanArray> {
+                            Ok(or_kleene(
+                                &result,
+                                &eq(&value, &expr?.into_array(num_rows)?)?,
+                            )?)
+                        },
+                    )?;
+
+                if self.negated {
+                    not(&found)?
+                } else {
+                    found
+                }
+            }
+        };
+        Ok(ColumnarValue::Array(Arc::new(r)))
+    }
 }
 
 impl std::fmt::Display for InListExpr {
@@ -349,30 +390,15 @@ impl PhysicalExpr for InListExpr {
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        let num_rows = batch.num_rows();
-        let value = self.expr.evaluate(batch)?;
-        let r = match &self.static_filter {
-            Some(f) => f.contains(value.into_array(num_rows)?.as_ref(), self.negated)?,
-            None => {
-                let value = value.into_array(num_rows)?;
-                let found = self.list.iter().map(|expr| expr.evaluate(batch)).try_fold(
-                    BooleanArray::new(BooleanBuffer::new_unset(num_rows), None),
-                    |result, expr| -> Result<BooleanArray> {
-                        Ok(or_kleene(
-                            &result,
-                            &eq(&value, &expr?.into_array(num_rows)?)?,
-                        )?)
-                    },
-                )?;
+        self.evaluate_impl(batch, None)
+    }
 
-                if self.negated {
-                    not(&found)?
-                } else {
-                    found
-                }
-            }
-        };
-        Ok(ColumnarValue::Array(Arc::new(r)))
+    fn evaluate_with_filter(
+        &self,
+        batch: &RecordBatch,
+        filter: &BooleanArray,
+    ) -> Result<ColumnarValue> {
+        self.evaluate_impl(batch, Some(filter))
     }
 
     fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {

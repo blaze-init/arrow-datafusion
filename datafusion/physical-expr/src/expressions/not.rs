@@ -26,6 +26,7 @@ use crate::physical_expr::down_cast_any_ref;
 use crate::PhysicalExpr;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
+use arrow_array::BooleanArray;
 use datafusion_common::{cast::as_boolean_array, Result, ScalarValue};
 use datafusion_expr::ColumnarValue;
 
@@ -46,6 +47,31 @@ impl NotExpr {
     pub fn arg(&self) -> &Arc<dyn PhysicalExpr> {
         &self.arg
     }
+
+    fn evaluate_impl(
+        &self,
+        batch: &RecordBatch,
+        filter: Option<&BooleanArray>,
+    ) -> Result<ColumnarValue> {
+        match self.arg.evaluate_with_filter_optional(batch, filter)? {
+            ColumnarValue::Array(array) => {
+                let array = as_boolean_array(&array)?;
+                Ok(ColumnarValue::Array(Arc::new(
+                    arrow::compute::kernels::boolean::not(array)?,
+                )))
+            }
+            ColumnarValue::Scalar(scalar) => {
+                if scalar.is_null() {
+                    return Ok(ColumnarValue::Scalar(ScalarValue::Boolean(None)));
+                }
+                let bool_value: bool = scalar.try_into()?;
+                Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(
+                    !bool_value,
+                ))))
+            }
+        }
+    }
+
 }
 
 impl fmt::Display for NotExpr {
@@ -69,24 +95,15 @@ impl PhysicalExpr for NotExpr {
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        let evaluate_arg = self.arg.evaluate(batch)?;
-        match evaluate_arg {
-            ColumnarValue::Array(array) => {
-                let array = as_boolean_array(&array)?;
-                Ok(ColumnarValue::Array(Arc::new(
-                    arrow::compute::kernels::boolean::not(array)?,
-                )))
-            }
-            ColumnarValue::Scalar(scalar) => {
-                if scalar.is_null() {
-                    return Ok(ColumnarValue::Scalar(ScalarValue::Boolean(None)));
-                }
-                let bool_value: bool = scalar.try_into()?;
-                Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(
-                    !bool_value,
-                ))))
-            }
-        }
+        self.evaluate_impl(batch, None)
+    }
+
+    fn evaluate_with_filter(
+        &self,
+        batch: &RecordBatch,
+        filter: &BooleanArray,
+    ) -> Result<ColumnarValue> {
+        self.evaluate_impl(batch, Some(filter))
     }
 
     fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {

@@ -26,6 +26,7 @@ use arrow::compute;
 use arrow::compute::{cast_with_options, CastOptions};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
+use arrow_array::BooleanArray;
 use compute::can_cast_types;
 use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
 use datafusion_common::{not_impl_err, DataFusionError, Result, ScalarValue};
@@ -55,6 +56,30 @@ impl TryCastExpr {
     pub fn cast_type(&self) -> &DataType {
         &self.cast_type
     }
+
+    fn evaluate_impl(
+        &self,
+        batch: &RecordBatch,
+        filter: Option<&BooleanArray>,
+    ) -> Result<ColumnarValue> {
+        let options = CastOptions {
+            safe: true,
+            format_options: DEFAULT_FORMAT_OPTIONS,
+        };
+        match self.expr.evaluate_with_filter_optional(batch, filter)? {
+            ColumnarValue::Array(array) => {
+                let cast = cast_with_options(&array, &self.cast_type, &options)?;
+                Ok(ColumnarValue::Array(cast))
+            }
+            ColumnarValue::Scalar(scalar) => {
+                let array = scalar.to_array()?;
+                let cast_array = cast_with_options(&array, &self.cast_type, &options)?;
+                let cast_scalar = ScalarValue::try_from_array(&cast_array, 0)?;
+                Ok(ColumnarValue::Scalar(cast_scalar))
+            }
+        }
+    }
+
 }
 
 impl fmt::Display for TryCastExpr {
@@ -78,23 +103,15 @@ impl PhysicalExpr for TryCastExpr {
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        let value = self.expr.evaluate(batch)?;
-        let options = CastOptions {
-            safe: true,
-            format_options: DEFAULT_FORMAT_OPTIONS,
-        };
-        match value {
-            ColumnarValue::Array(array) => {
-                let cast = cast_with_options(&array, &self.cast_type, &options)?;
-                Ok(ColumnarValue::Array(cast))
-            }
-            ColumnarValue::Scalar(scalar) => {
-                let array = scalar.to_array()?;
-                let cast_array = cast_with_options(&array, &self.cast_type, &options)?;
-                let cast_scalar = ScalarValue::try_from_array(&cast_array, 0)?;
-                Ok(ColumnarValue::Scalar(cast_scalar))
-            }
-        }
+        self.evaluate_impl(batch, None)
+    }
+
+    fn evaluate_with_filter(
+        &self,
+        batch: &RecordBatch,
+        filter: &BooleanArray,
+    ) -> Result<ColumnarValue> {
+        self.evaluate_impl(batch, Some(filter))
     }
 
     fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {

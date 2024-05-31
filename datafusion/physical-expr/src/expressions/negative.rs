@@ -30,6 +30,7 @@ use arrow::{
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
+use arrow_array::BooleanArray;
 use datafusion_common::{plan_err, DataFusionError, Result};
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_expr::{
@@ -54,6 +55,23 @@ impl NegativeExpr {
     pub fn arg(&self) -> &Arc<dyn PhysicalExpr> {
         &self.arg
     }
+
+    fn evaluate_impl(
+        &self,
+        batch: &RecordBatch,
+        filter: Option<&BooleanArray>,
+    ) -> Result<ColumnarValue> {
+        let arg = self.arg.evaluate_with_filter_optional(batch, filter)?;
+        match arg {
+            ColumnarValue::Array(array) => {
+                let result = neg_wrapping(array.as_ref())?;
+                Ok(ColumnarValue::Array(result))
+            }
+            ColumnarValue::Scalar(scalar) => {
+                Ok(ColumnarValue::Scalar((scalar.arithmetic_negate())?))
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for NegativeExpr {
@@ -77,16 +95,15 @@ impl PhysicalExpr for NegativeExpr {
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        let arg = self.arg.evaluate(batch)?;
-        match arg {
-            ColumnarValue::Array(array) => {
-                let result = neg_wrapping(array.as_ref())?;
-                Ok(ColumnarValue::Array(result))
-            }
-            ColumnarValue::Scalar(scalar) => {
-                Ok(ColumnarValue::Scalar((scalar.arithmetic_negate())?))
-            }
-        }
+        self.evaluate_impl(batch, None)
+    }
+
+    fn evaluate_with_filter(
+        &self,
+        batch: &RecordBatch,
+        filter: &BooleanArray,
+    ) -> Result<ColumnarValue> {
+        self.evaluate_impl(batch, Some(filter))
     }
 
     fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {

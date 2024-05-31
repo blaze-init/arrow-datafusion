@@ -24,9 +24,9 @@ use crate::sort_properties::SortProperties;
 pub use crate::utils::scatter;
 
 use arrow::array::BooleanArray;
-use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
+use arrow_array::Array;
 use datafusion_common::utils::DataPtr;
 use datafusion_common::{internal_err, not_impl_err, DataFusionError, Result};
 use datafusion_expr::interval_arithmetic::Interval;
@@ -110,17 +110,41 @@ pub trait PhysicalExpr: Send + Sync + Display + Debug + PartialEq<dyn Any> {
         batch: &RecordBatch,
         selection: &BooleanArray,
     ) -> Result<ColumnarValue> {
-        let tmp_batch = filter_record_batch(batch, selection)?;
 
-        let tmp_result = self.evaluate(&tmp_batch)?;
+        log::info!("XXX {:?}.evaluate_selection, batch.len: {}, selection.len: {}", self, batch.num_rows(), selection.len());
+        Ok(match self.evaluate_with_filter(batch, selection)? {
+            ColumnarValue::Array(array) if array.len() < batch.num_rows() => {
+                ColumnarValue::Array(scatter(selection, &array)?)
+            }
+            other => other,
+        })
+    }
 
-        if batch.num_rows() == tmp_batch.num_rows() {
-            // All values from the `selection` filter are true.
-            Ok(tmp_result)
-        } else if let ColumnarValue::Array(a) = tmp_result {
-            scatter(selection, a.as_ref()).map(ColumnarValue::Array)
-        } else {
-            Ok(tmp_result)
+    fn evaluate_selection_optional(
+        &self,
+        batch: &RecordBatch,
+        selection: Option<&BooleanArray>,
+    ) -> Result<ColumnarValue> {
+        match selection {
+            Some(selection) => self.evaluate_selection(batch, selection),
+            None => self.evaluate(batch),
+        }
+    }
+
+    fn evaluate_with_filter(
+        &self,
+        batch: &RecordBatch,
+        filter: &BooleanArray,
+    ) -> Result<ColumnarValue>;
+
+    fn evaluate_with_filter_optional(
+        &self,
+        batch: &RecordBatch,
+        filter: Option<&BooleanArray>,
+    ) -> Result<ColumnarValue> {
+        match filter {
+            Some(filter) => self.evaluate_with_filter(batch, filter),
+            None => self.evaluate(batch),
         }
     }
 

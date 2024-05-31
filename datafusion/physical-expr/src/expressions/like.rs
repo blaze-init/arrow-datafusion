@@ -22,6 +22,7 @@ use crate::{physical_expr::down_cast_any_ref, PhysicalExpr};
 
 use crate::expressions::datum::apply_cmp;
 use arrow::record_batch::RecordBatch;
+use arrow_array::BooleanArray;
 use arrow_schema::{DataType, Schema};
 use datafusion_common::{internal_err, DataFusionError, Result};
 use datafusion_expr::ColumnarValue;
@@ -79,6 +80,22 @@ impl LikeExpr {
             (true, true) => "NOT ILIKE",
         }
     }
+
+    fn evaluate_impl(
+        &self,
+        batch: &RecordBatch,
+        filter: Option<&BooleanArray>,
+    ) -> Result<ColumnarValue> {
+        use arrow::compute::{like, ilike, nlike, nilike};
+        let lhs = self.expr.evaluate_with_filter_optional(batch, filter)?;
+        let rhs = self.pattern.evaluate_with_filter_optional(batch, filter)?;
+        match (self.negated, self.case_insensitive) {
+            (false, false) => apply_cmp(&lhs, &rhs, like),
+            (false, true) => apply_cmp(&lhs, &rhs, ilike),
+            (true, false) => apply_cmp(&lhs, &rhs, nlike),
+            (true, true) => apply_cmp(&lhs, &rhs, nilike),
+        }
+    }
 }
 
 impl std::fmt::Display for LikeExpr {
@@ -101,15 +118,15 @@ impl PhysicalExpr for LikeExpr {
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        use arrow::compute::*;
-        let lhs = self.expr.evaluate(batch)?;
-        let rhs = self.pattern.evaluate(batch)?;
-        match (self.negated, self.case_insensitive) {
-            (false, false) => apply_cmp(&lhs, &rhs, like),
-            (false, true) => apply_cmp(&lhs, &rhs, ilike),
-            (true, false) => apply_cmp(&lhs, &rhs, nlike),
-            (true, true) => apply_cmp(&lhs, &rhs, nilike),
-        }
+        self.evaluate_impl(batch, None)
+    }
+
+    fn evaluate_with_filter(
+        &self,
+        batch: &RecordBatch,
+        filter: &BooleanArray,
+    ) -> Result<ColumnarValue> {
+        self.evaluate_impl(batch, Some(filter))
     }
 
     fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {

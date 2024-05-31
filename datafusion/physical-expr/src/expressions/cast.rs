@@ -27,6 +27,7 @@ use crate::PhysicalExpr;
 use arrow::compute::{can_cast_types, kernels, CastOptions};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
+use arrow_array::BooleanArray;
 use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
 use datafusion_common::{not_impl_err, DataFusionError, Result, ScalarValue};
 use datafusion_expr::interval_arithmetic::Interval;
@@ -100,6 +101,15 @@ impl PhysicalExpr for CastExpr {
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
         let value = self.expr.evaluate(batch)?;
+        cast_column(&value, &self.cast_type, Some(&self.cast_options))
+    }
+
+    fn evaluate_with_filter(
+        &self,
+        batch: &RecordBatch,
+        filter: &BooleanArray,
+    ) -> Result<ColumnarValue> {
+        let value = self.expr.evaluate_with_filter(batch, filter)?;
         cast_column(&value, &self.cast_type, Some(&self.cast_options))
     }
 

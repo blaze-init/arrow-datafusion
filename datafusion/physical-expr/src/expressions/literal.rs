@@ -29,6 +29,7 @@ use arrow::{
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
+use arrow_array::BooleanArray;
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::{ColumnarValue, Expr};
 
@@ -72,6 +73,14 @@ impl PhysicalExpr for Literal {
 
     fn evaluate(&self, _batch: &RecordBatch) -> Result<ColumnarValue> {
         Ok(ColumnarValue::Scalar(self.value.clone()))
+    }
+
+    fn evaluate_with_filter(
+        &self,
+        batch: &RecordBatch,
+        _filter: &BooleanArray,
+    ) -> Result<ColumnarValue> {
+        self.evaluate(batch)
     }
 
     fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
