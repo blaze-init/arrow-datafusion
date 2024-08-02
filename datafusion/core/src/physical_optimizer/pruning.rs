@@ -874,9 +874,11 @@ fn build_statistics_record_batch<S: PruningStatistics>(
         arrays
     );
 
-    RecordBatch::try_new_with_options(schema, arrays, &options).map_err(|err| {
+    let batch = RecordBatch::try_new_with_options(schema, arrays, &options).map_err(|err| {
         plan_datafusion_err!("Can not create statistics record batch: {err}")
-    })
+    })?;
+    log::warn!("XXX \n{}", arrow::util::pretty::pretty_format_batches(&[batch.clone()])?.to_string());
+    Ok(batch)
 }
 
 /// build column stat array from statistics
