@@ -34,7 +34,9 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::{RecordBatch, RecordBatchOptions},
 };
+use arrow_array::{Array, ArrowNativeTypeOp};
 use arrow_array::cast::AsArray;
+use arrow_array::types::{Float32Type, Float64Type};
 use datafusion_common::tree_node::TransformedResult;
 use datafusion_common::{
     internal_err, plan_datafusion_err, plan_err,
@@ -45,6 +47,7 @@ use datafusion_physical_expr::utils::{collect_columns, Guarantee, LiteralGuarant
 use datafusion_physical_expr::{expressions as phys_expr, PhysicalExprRef};
 
 use log::trace;
+use datafusion_common::cast::{as_float32_array, as_float64_array};
 
 /// A source of runtime statistical information to [`PruningPredicate`]s.
 ///
@@ -915,6 +918,134 @@ fn build_statistics_record_batch<S: PruningStatistics>(
             StatisticsType::NullCount => statistics.null_counts(&column),
             StatisticsType::RowCount => statistics.row_counts(&column),
         };
+
+        let array = array.and_then(|array| -> Option<ArrayRef> {
+            if array.data_type().is_floating() {
+                let min_values = statistics.min_values(&column);
+                let max_values = statistics.max_values(&column);
+
+                let min_is_nan = match &min_values {
+                    Some(array) => {
+                        match array.data_type() {
+                            DataType::Float32 => as_float32_array(&array)
+                                .ok()?
+                                .iter()
+                                .flatten()
+                                .any(|v| v.is_nan()),
+                            DataType::Float64 => as_float64_array(&array)
+                                .ok()?
+                                .iter()
+                                .flatten()
+                                .any(|v| v.is_nan()),
+                            _ => false,
+                        }
+                    }
+                    None => false,
+                };
+                let max_is_nan = match &max_values {
+                    Some(array) => {
+                        match array.data_type() {
+                            DataType::Float32 => as_float32_array(&array)
+                                .ok()?
+                                .iter()
+                                .flatten()
+                                .any(|v| v.is_nan()),
+                            DataType::Float64 => as_float64_array(&array)
+                                .ok()?
+                                .iter()
+                                .flatten()
+                                .any(|v| v.is_nan()),
+                            _ => false,
+                        }
+                    }
+                    None => false,
+                };
+                if min_is_nan || max_is_nan {
+                    return None;
+                }
+
+                let min_is_positive_0 = match &min_values {
+                    Some(array) => {
+                        match array.data_type() {
+                            DataType::Float32 => as_float32_array(&array)
+                                .ok()?
+                                .iter()
+                                .flatten()
+                                .any(|v| v.is_sign_positive() && v.is_zero()),
+                            DataType::Float64 => as_float64_array(&array)
+                                .ok()?
+                                .iter()
+                                .flatten()
+                                .any(|v| v.is_sign_positive() && v.is_zero()),
+                            _ => false,
+                        }
+                    },
+                    _ => false,
+                };
+                let max_is_negative_0 = match &max_values {
+                    Some(array) => {
+                        match array.data_type() {
+                            DataType::Float32 => as_float32_array(&array)
+                                .ok()?
+                                .iter()
+                                .flatten()
+                                .any(|v| v.is_sign_negative() && v.is_zero()),
+                            DataType::Float64 => as_float64_array(&array)
+                                .ok()?
+                                .iter()
+                                .flatten()
+                                .any(|v| v.is_sign_negative() && v.is_zero()),
+                            _ => false,
+                        }
+                    },
+                    _ => false,
+                };
+
+                if min_is_positive_0 && *statistics_type == StatisticsType::Min {
+                    match array.data_type() {
+                        DataType::Float32 => return Some(Arc::new(
+                            arrow::compute::unary::<_, _, Float32Type>(
+                                as_float32_array(&array).ok()?,
+                                |v| if v.is_sign_positive() && v.is_zero() {
+                                    0.0f32
+                                } else {
+                                    v
+                                }))),
+                        DataType::Float64 => return Some(Arc::new(
+                            arrow::compute::unary::<_, _, Float64Type>(
+                                as_float64_array(&array).ok()?,
+                                |v| if v.is_sign_positive() && v.is_zero() {
+                                    0.0f64
+                                } else {
+                                    v
+                                }))),
+                        _ => return None,
+                    };
+                }
+                if max_is_negative_0 && *statistics_type == StatisticsType::Max {
+                    match array.data_type() {
+                        DataType::Float32 => return Some(Arc::new(
+                            arrow::compute::unary::<_, _, Float32Type>(
+                                as_float32_array(&array).ok()?,
+                                |v| if v.is_sign_negative() && v.is_zero() {
+                                    0.0f32
+                                } else {
+                                    v
+                                }))),
+                        DataType::Float64 => return Some(Arc::new(
+                            arrow::compute::unary::<_, _, Float64Type>(
+                                as_float64_array(&array).ok()?,
+                                |v| if v.is_sign_negative() && v.is_zero() {
+                                    0.0f64
+                                } else {
+                                    v
+                                }))),
+                        _ => return None,
+                    };
+                }
+            }
+            Some(array)
+        });
         let array = array.unwrap_or_else(|| new_null_array(data_type, num_containers));
 
         if num_containers != array.len() {
