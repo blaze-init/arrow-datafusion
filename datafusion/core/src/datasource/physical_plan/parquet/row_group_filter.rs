@@ -18,13 +18,12 @@
 use crate::datasource::listing::FileRange;
 use crate::physical_optimizer::pruning::{PruningPredicate, PruningStatistics};
 use arrow::{array::ArrayRef, datatypes::Schema};
-use arrow_array::BooleanArray;
+use arrow_array::{Array, BooleanArray, ListArray};
 use datafusion_common::{Column, Result, ScalarValue};
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::arrow::parquet_column;
 use parquet::basic::Type;
 use parquet::data_type::Decimal;
-use parquet::schema::types::SchemaDescriptor;
 use parquet::{
     arrow::{async_reader::AsyncFileReader, ParquetRecordBatchStreamBuilder},
     bloom_filter::Sbbf,
@@ -34,6 +33,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::{ParquetAccessPlan, ParquetFileMetrics};
+use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_schema::Field;
+use std::cell::{OnceCell, RefCell};
 
 /// Reduces the [`ParquetAccessPlan`] based on row group level metadata.
 ///
@@ -101,12 +103,13 @@ impl RowGroupAccessPlanFilter {
     ///
     /// # Panics
     /// if `groups.len() != self.len()`
-    pub fn prune_by_statistics(
+    pub fn prune_by_statistics<T: AsyncFileReader + Send + 'static>(
         &mut self,
+        builder: &mut ParquetRecordBatchStreamBuilder<T>,
         arrow_schema: &Schema,
-        parquet_schema: &SchemaDescriptor,
         groups: &[RowGroupMetaData],
         predicate: &PruningPredicate,
+        use_dictionary_filtering: bool,
         metrics: &ParquetFileMetrics,
     ) {
         assert_eq!(groups.len(), self.access_plan.len());
@@ -118,9 +121,11 @@ impl RowGroupAccessPlanFilter {
             .collect::<Vec<_>>();
 
         let pruning_stats = RowGroupPruningStatistics {
-            parquet_schema,
             row_group_metadatas,
             arrow_schema,
+            use_dictionary_filtering,
+            cached_dictionaries: vec![OnceCell::new(); arrow_schema.fields().len()],
+            builder: RefCell::new(builder),
         };
 
         // try to prune the row groups in a single call
@@ -337,34 +342,51 @@ impl PruningStatistics for BloomFilterStatistics {
 
         Some(BooleanArray::from(vec![contains]))
     }
+
+    fn dictionary_values(&self, _column: &Column) -> Option<ArrayRef> {
+        None
+    }
 }
 
 /// Wraps a slice of [`RowGroupMetaData`] in a way that implements [`PruningStatistics`]
-struct RowGroupPruningStatistics<'a> {
-    parquet_schema: &'a SchemaDescriptor,
+struct RowGroupPruningStatistics<'a, T: AsyncFileReader + Send + 'static> {
     row_group_metadatas: Vec<&'a RowGroupMetaData>,
     arrow_schema: &'a Schema,
+    use_dictionary_filtering: bool,
+    cached_dictionaries: Vec<OnceCell<Option<ArrayRef>>>,
+    builder: RefCell<&'a mut ParquetRecordBatchStreamBuilder<T>>,
 }
 
-impl<'a> RowGroupPruningStatistics<'a> {
+impl<'a, T: AsyncFileReader + Send + 'static> RowGroupPruningStatistics<'a, T> {
     /// Return an iterator over the row group metadata
-    fn metadata_iter(&'a self) -> impl Iterator<Item = &'a RowGroupMetaData> + 'a {
-        self.row_group_metadatas.iter().copied()
+    fn metadata_iter(&self) -> impl Iterator<Item = &'a RowGroupMetaData> + 'a {
+        // blaze: bypass lifetime checker
+        let unchecked_self: &'a Self = unsafe {
+            std::mem::transmute(self)
+        };
+        unchecked_self.row_group_metadatas.iter().copied()
     }
 
     fn statistics_converter<'b>(
-        &'a self,
+        &self,
         column: &'b Column,
     ) -> Result<StatisticsConverter<'a>> {
+        // blaze: bypass lifetime checker
+        let unchecked_self: &'a Self = unsafe {
+            std::mem::transmute(self)
+        };
         Ok(StatisticsConverter::try_new(
             &column.name,
-            self.arrow_schema,
-            self.parquet_schema,
+            unchecked_self.arrow_schema,
+            unsafe {
+                // blaze: bypass lifetime checker
+                std::mem::transmute(unchecked_self.builder.borrow_mut().parquet_schema())
+            }
         )?)
     }
 }
 
-impl<'a> PruningStatistics for RowGroupPruningStatistics<'a> {
+impl<'a, T: AsyncFileReader + Send + 'static> PruningStatistics for RowGroupPruningStatistics<'a, T> {
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
         self.statistics_converter(column)
             .and_then(|c| Ok(c.row_group_mins(self.metadata_iter())?))
@@ -403,6 +425,50 @@ impl<'a> PruningStatistics for RowGroupPruningStatistics<'a> {
         _values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray> {
         None
+    }
+
+    fn dictionary_values(&self, column: &Column) -> Option<ArrayRef> {
+        if !self.use_dictionary_filtering {
+            return None;
+        }
+        if self.row_group_metadatas.is_empty() {
+            return None;
+        }
+
+        let col_idx = self
+            .row_group_metadatas
+            .first()
+            .unwrap()
+            .columns()
+            .iter()
+            .position(|c| c.column_path().string().eq_ignore_ascii_case(&column.flat_name()))?;
+
+        self.cached_dictionaries[col_idx].get_or_init(|| {
+            let mut values = vec![];
+            for &row_group_metadata in &self.row_group_metadatas {
+                let dict_values = match futures::executor::block_on(async move {
+                    parquet::blaze::get_dictionary_for_pruning(
+                        &mut self.builder.borrow_mut().input.0,
+                        row_group_metadata,
+                        col_idx,
+                    ).await
+                }) {
+                    Ok(Some(dict_values)) => dict_values,
+                    _ => return None,
+                };
+                let dict_array = ListArray::try_new(
+                    Arc::new(Field::new("items", dict_values.data_type().clone(), false)),
+                    OffsetBuffer::new(ScalarBuffer::from(vec![0, dict_values.len() as i32])),
+                    dict_values,
+                    None,
+                ).ok()?;
+                values.push(dict_array);
+            }
+            arrow::compute::concat(&values.iter()
+                .map(|c| c as &dyn Array)
+                .collect::<Vec<_>>()
+            ).ok()
+        }).as_ref().cloned()
     }
 }
 
