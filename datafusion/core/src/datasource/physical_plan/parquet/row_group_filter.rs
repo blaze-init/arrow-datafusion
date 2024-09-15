@@ -18,13 +18,12 @@
 use crate::datasource::listing::FileRange;
 use crate::physical_optimizer::pruning::{PruningPredicate, PruningStatistics};
 use arrow::{array::ArrayRef, datatypes::Schema};
-use arrow_array::BooleanArray;
+use arrow_array::{Array, BooleanArray, ListArray};
 use datafusion_common::{Column, Result, ScalarValue};
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::arrow::parquet_column;
 use parquet::basic::Type;
 use parquet::data_type::Decimal;
-use parquet::schema::types::SchemaDescriptor;
 use parquet::{
     arrow::{async_reader::AsyncFileReader, ParquetRecordBatchStreamBuilder},
     bloom_filter::Sbbf,
@@ -34,6 +33,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::{ParquetAccessPlan, ParquetFileMetrics};
+use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_schema::Field;
+use std::cell::{OnceCell, RefCell};
+use parking_lot::Mutex;
 
 /// Reduces the [`ParquetAccessPlan`] based on row group level metadata.
 ///
@@ -101,45 +104,57 @@ impl RowGroupAccessPlanFilter {
     ///
     /// # Panics
     /// if `groups.len() != self.len()`
-    pub fn prune_by_statistics(
+    pub fn prune_by_statistics<T: AsyncFileReader + Send + 'static>(
         &mut self,
+        builder: &mut ParquetRecordBatchStreamBuilder<T>,
         arrow_schema: &Schema,
-        parquet_schema: &SchemaDescriptor,
         groups: &[RowGroupMetaData],
         predicate: &PruningPredicate,
         metrics: &ParquetFileMetrics,
     ) {
         assert_eq!(groups.len(), self.access_plan.len());
         // Indexes of row groups still to scan
+        // blaze: for less reading of dictionary pages, we still prune in separated passes
         let row_group_indexes = self.access_plan.row_group_indexes();
-        let row_group_metadatas = row_group_indexes
-            .iter()
-            .map(|&i| &groups[i])
-            .collect::<Vec<_>>();
+        for &rg_idx in &row_group_indexes {
+            let row_group_metadatas = vec![&groups[rg_idx]];
+            let mut pruning_stats = RowGroupPruningStatistics {
+                row_group_metadatas,
+                arrow_schema,
+                use_dictionary_filtering: false,
+                cached_dictionaries: Mutex::new(vec![]),
+                builder: RefCell::new(builder),
+            };
 
-        let pruning_stats = RowGroupPruningStatistics {
-            parquet_schema,
-            row_group_metadatas,
-            arrow_schema,
-        };
-
-        // try to prune the row groups in a single call
-        match predicate.prune(&pruning_stats) {
-            Ok(values) => {
-                // values[i] is false means the predicate could not be true for row group i
-                for (idx, &value) in row_group_indexes.iter().zip(values.iter()) {
-                    if !value {
-                        self.access_plan.skip(*idx);
-                        metrics.row_groups_pruned_statistics.add(1);
-                    } else {
-                        metrics.row_groups_matched_statistics.add(1);
+            // prune using two runs because pruning with dictionary filtering is more expensive
+            // first run: prune without dictionary filtering
+            match predicate.prune(&pruning_stats) {
+                Ok(values) => {
+                    if !values[0] {
+                        self.access_plan.skip(rg_idx);
+                        continue; // no need to prune with dictionary
                     }
                 }
+                Err(e) => {
+                    log::info!("Error evaluating row group predicate values without dictionary {e}");
+                    metrics.predicate_evaluation_errors.add(1);
+                    continue; // no need to prune with dictionary
+                }
             }
-            // stats filter array could not be built, so we can't prune
-            Err(e) => {
-                log::debug!("Error evaluating row group predicate values {e}");
-                metrics.predicate_evaluation_errors.add(1);
+
+            // second run: prune with dictionary filtering
+            pruning_stats.use_dictionary_filtering = true;
+            pruning_stats.cached_dictionaries = Mutex::new(vec![]);
+            match predicate.prune(&pruning_stats) {
+                Ok(values) => {
+                    if !values[0] {
+                        self.access_plan.skip(rg_idx);
+                    }
+                }
+                Err(e) => {
+                    log::info!("Error evaluating row group predicate values with dictionary {e}");
+                    metrics.predicate_evaluation_errors.add(1);
+                }
             }
         }
     }
@@ -337,34 +352,51 @@ impl PruningStatistics for BloomFilterStatistics {
 
         Some(BooleanArray::from(vec![contains]))
     }
+
+    fn dictionary_values(&self, _column: &Column) -> Option<ArrayRef> {
+        None
+    }
 }
 
 /// Wraps a slice of [`RowGroupMetaData`] in a way that implements [`PruningStatistics`]
-struct RowGroupPruningStatistics<'a> {
-    parquet_schema: &'a SchemaDescriptor,
+struct RowGroupPruningStatistics<'a, T: AsyncFileReader + Send + 'static> {
     row_group_metadatas: Vec<&'a RowGroupMetaData>,
     arrow_schema: &'a Schema,
+    use_dictionary_filtering: bool,
+    cached_dictionaries: Mutex<Vec<OnceCell<Option<ArrayRef>>>>,
+    builder: RefCell<&'a mut ParquetRecordBatchStreamBuilder<T>>,
 }
 
-impl<'a> RowGroupPruningStatistics<'a> {
+impl<'a, T: AsyncFileReader + Send + 'static> RowGroupPruningStatistics<'a, T> {
     /// Return an iterator over the row group metadata
-    fn metadata_iter(&'a self) -> impl Iterator<Item = &'a RowGroupMetaData> + 'a {
-        self.row_group_metadatas.iter().copied()
+    fn metadata_iter(&self) -> impl Iterator<Item = &'a RowGroupMetaData> + 'a {
+        // blaze: bypass lifetime checker
+        let unchecked_self: &'a Self = unsafe {
+            std::mem::transmute(self)
+        };
+        unchecked_self.row_group_metadatas.iter().copied()
     }
 
     fn statistics_converter<'b>(
-        &'a self,
+        &self,
         column: &'b Column,
     ) -> Result<StatisticsConverter<'a>> {
+        // blaze: bypass lifetime checker
+        let unchecked_self: &'a Self = unsafe {
+            std::mem::transmute(self)
+        };
         Ok(StatisticsConverter::try_new(
             &column.name,
-            self.arrow_schema,
-            self.parquet_schema,
+            unchecked_self.arrow_schema,
+            unsafe {
+                // blaze: bypass lifetime checker
+                std::mem::transmute(unchecked_self.builder.borrow_mut().parquet_schema())
+            }
         )?)
     }
 }
 
-impl<'a> PruningStatistics for RowGroupPruningStatistics<'a> {
+impl<'a, T: AsyncFileReader + Send + 'static> PruningStatistics for RowGroupPruningStatistics<'a, T> {
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
         self.statistics_converter(column)
             .and_then(|c| Ok(c.row_group_mins(self.metadata_iter())?))
@@ -403,6 +435,50 @@ impl<'a> PruningStatistics for RowGroupPruningStatistics<'a> {
         _values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray> {
         None
+    }
+
+    fn dictionary_values(&self, column: &Column) -> Option<ArrayRef> {
+        if !self.use_dictionary_filtering {
+            return None;
+        }
+
+        let col_idx = self
+            .row_group_metadatas
+            .first()
+            .unwrap()
+            .columns()
+            .iter()
+            .position(|c| c.column_path().string().eq_ignore_ascii_case(&column.flat_name()))?;
+
+        let mut cached_dictionaries = self.cached_dictionaries.lock();
+        cached_dictionaries.resize_with(col_idx + 1, || Default::default());
+        cached_dictionaries[col_idx].get_or_init(|| {
+            let mut values = vec![];
+            for row_group_metadata in self.metadata_iter() {
+                let dict_values =
+                    parquet::blaze::get_dictionary_for_pruning(
+                        &mut self.builder.borrow_mut().input.0,
+                        row_group_metadata,
+                        col_idx,
+                    )
+                    .ok()
+                    .flatten()?;
+
+                let dict_array =
+                    ListArray::try_new(
+                        Arc::new(Field::new("item", dict_values.data_type().clone(), true)),
+                        OffsetBuffer::new(ScalarBuffer::from(vec![0, dict_values.len() as i32])),
+                        dict_values,
+                        None,
+                    )
+                    .ok()?;
+                values.push(dict_array);
+            }
+            arrow::compute::concat(&values.iter()
+                .map(|c| c as &dyn Array)
+                .collect::<Vec<_>>()
+            ).ok()
+        }).as_ref().cloned()
     }
 }
 
