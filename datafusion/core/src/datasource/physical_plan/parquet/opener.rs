@@ -166,8 +166,8 @@ impl FileOpener for ParquetOpener {
             // If there is a predicate that can be evaluated against the metadata
             if let Some(predicate) = predicate.as_ref() {
                 row_groups.prune_by_statistics(
+                    &mut builder,
                     &file_schema,
-                    builder.parquet_schema(),
                     rg_metadata,
                     predicate,
                     &file_metrics,
