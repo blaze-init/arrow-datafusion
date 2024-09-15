@@ -126,6 +126,11 @@ pub trait PruningStatistics {
         column: &Column,
         values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray>;
+
+    /// return dictionary values for the named column as ListArray<?>
+    fn dictionary_values(&self, _column: &Column) -> Option<ArrayRef> {
+        None
+    }
 }
 
 /// Prune files based on their partition values.

@@ -45,8 +45,10 @@ use datafusion_common::{
 use datafusion_common::{Column, DFSchema};
 use datafusion_common::cast::{as_float32_array, as_float64_array};
 use datafusion_expr_common::operator::Operator;
+use datafusion_expr::ScalarUDF;
+use datafusion_functions_nested::array_has::ArrayHas;
 use datafusion_physical_expr::utils::{collect_columns, Guarantee, LiteralGuarantee};
-use datafusion_physical_expr::{expressions as phys_expr, PhysicalExprRef};
+use datafusion_physical_expr::{expressions as phys_expr, PhysicalExprRef, ScalarFunctionExpr};
 use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr;
 use datafusion_physical_plan::{ColumnarValue, PhysicalExpr};
 
@@ -814,6 +816,7 @@ impl RequiredColumns {
             StatisticsType::Max => format!("{column_name}_max"),
             StatisticsType::NullCount => format!("{column_name}_null_count"),
             StatisticsType::RowCount => "row_count".to_string(),
+            StatisticsType::Dictionary => "dict".to_string(),
         };
 
         let stat_column = phys_expr::Column::new(&stat_column_name, idx);
@@ -868,6 +871,26 @@ impl RequiredColumns {
     ) -> Result<Arc<dyn PhysicalExpr>> {
         self.stat_column_expr(column, column_expr, field, StatisticsType::RowCount)
     }
+
+
+    /// rewrite col --> col_dict
+    fn dict_column_expr(
+        &mut self,
+        column: &phys_expr::Column,
+        column_expr: &Arc<dyn PhysicalExpr>,
+        field: &Field,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+
+        let list_type = DataType::List(Arc::new(
+            Field::new("item", field.data_type().clone(), true)
+        ));
+        self.stat_column_expr(
+            column,
+            column_expr,
+            &field.clone().with_data_type(list_type),
+            StatisticsType::Dictionary,
+        )
+    }
 }
 
 impl From<Vec<(phys_expr::Column, StatisticsType, Field)>> for RequiredColumns {
@@ -918,6 +941,7 @@ fn build_statistics_record_batch<S: PruningStatistics + ?Sized>(
             StatisticsType::Max => statistics.max_values(&column),
             StatisticsType::NullCount => statistics.null_counts(&column),
             StatisticsType::RowCount => statistics.row_counts(&column),
+            StatisticsType::Dictionary => statistics.dictionary_values(&column),
         };
 
         let array = array.and_then(|array| -> Option<ArrayRef> {
@@ -1189,6 +1213,20 @@ impl<'a> PruningExpressionBuilder<'a> {
             &column_expr,
             row_count_field,
         )
+    }
+
+    fn dict_column_expr(&mut self) -> Result<Arc<dyn PhysicalExpr>> {
+        self.required_columns
+            .dict_column_expr(&self.column, &self.column_expr, self.field)
+    }
+
+    fn dict_column_contains_expr(&mut self) -> Result<Arc<dyn PhysicalExpr>> {
+        Ok(Arc::new(ScalarFunctionExpr::new(
+            "array_has",
+            Arc::new(ScalarUDF::from(ArrayHas::new())),
+            vec![self.dict_column_expr()?, self.scalar_expr().clone()],
+            Arc::new(Field::new("result", DataType::Boolean, true)),
+        )))
     }
 }
 
@@ -1689,7 +1727,7 @@ fn build_statistics_expr(
             // (column / 2) = 4 => (column_min / 2) <= 4 && 4 <= (column_max / 2)
             let min_column_expr = expr_builder.min_column_expr()?;
             let max_column_expr = expr_builder.max_column_expr()?;
-            Arc::new(phys_expr::BinaryExpr::new(
+            let stat_pred_expr = Arc::new(phys_expr::BinaryExpr::new(
                 Arc::new(phys_expr::BinaryExpr::new(
                     min_column_expr,
                     Operator::LtEq,
@@ -1701,6 +1739,17 @@ fn build_statistics_expr(
                     Operator::LtEq,
                     max_column_expr,
                 )),
+            ));
+
+            // append dict_pred expr (stat && dictionary_contains(column))
+            let dict = expr_builder.dict_column_expr()?;
+            let has_no_stat_pred = Arc::new(phys_expr::IsNullExpr::new(stat_pred_expr.clone()));
+            let has_no_dict = Arc::new(phys_expr::IsNullExpr::new(dict));
+            let dict_contained = expr_builder.dict_column_contains_expr()?;
+            Arc::new(phys_expr::BinaryExpr::new(
+                Arc::new(phys_expr::BinaryExpr::new(has_no_stat_pred, Operator::Or, stat_pred_expr)),
+                Operator::And,
+                Arc::new(phys_expr::BinaryExpr::new(has_no_dict, Operator::Or, dict_contained)),
             ))
         }
         Operator::NotLikeMatch => build_not_like_match(expr_builder)?,
@@ -1989,6 +2038,7 @@ pub(crate) enum StatisticsType {
     Max,
     NullCount,
     RowCount,
+    Dictionary,
 }
 
 #[cfg(test)]
@@ -2350,6 +2400,10 @@ mod tests {
                 .get(column)
                 .and_then(|container_stats| container_stats.contained(values))
         }
+
+        fn dictionary_values(&self, column: &Column) -> Option<ArrayRef> {
+            None
+        }
     }
 
     /// Returns the specified min/max container values
@@ -2385,6 +2439,10 @@ mod tests {
             _column: &Column,
             _values: &HashSet<ScalarValue>,
         ) -> Option<BooleanArray> {
+            None
+        }
+
+        fn dictionary_values(&self, column: &Column) -> Option<ArrayRef> {
             None
         }
     }

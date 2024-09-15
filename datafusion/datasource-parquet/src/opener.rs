@@ -345,8 +345,8 @@ impl FileOpener for ParquetOpener {
             if let Some(predicate) = predicate.as_ref() {
                 if enable_row_group_stats_pruning {
                     row_groups.prune_by_statistics(
+                        &mut builder,
                         &physical_file_schema,
-                        builder.parquet_schema(),
                         rg_metadata,
                         predicate,
                         &file_metrics,

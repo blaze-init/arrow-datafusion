@@ -507,4 +507,8 @@ impl PruningStatistics for PagesPruningStatistics<'_> {
     ) -> Option<BooleanArray> {
         None
     }
+
+    fn dictionary_values(&self, _column: &datafusion_common::Column) -> Option<ArrayRef> {
+        None
+    }
 }
