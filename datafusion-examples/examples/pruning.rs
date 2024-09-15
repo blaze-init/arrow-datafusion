@@ -182,6 +182,10 @@ impl PruningStatistics for MyCatalog {
         // but we do not illustrate that here
         None
     }
+
+    fn dictionary_values(&self, column: &Column) -> Option<ArrayRef> {
+        None
+    }
 }
 
 fn create_pruning_predicate(expr: Expr, schema: &SchemaRef) -> PruningPredicate {
