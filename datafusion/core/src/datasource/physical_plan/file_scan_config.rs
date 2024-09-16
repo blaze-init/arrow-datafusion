@@ -235,8 +235,11 @@ impl FileScanConfig {
                 table_cols_stats.push(self.statistics.column_statistics[idx].clone())
             } else {
                 let partition_idx = idx - self.file_schema.fields().len();
-                table_fields.push(self.table_partition_cols[partition_idx].to_owned());
-                // TODO provide accurate stat for partition column (#1186)
+                table_fields.push(self.table_partition_cols[partition_idx]
+                    .clone() // blaze: spark allows nullable partition key
+                    .with_nullable(true));
+
+        // TODO provide accurate stat for partition column (#1186)
                 table_cols_stats.push(ColumnStatistics::new_unknown())
             }
         }
