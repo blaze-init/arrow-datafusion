@@ -1483,6 +1483,48 @@ fn build_is_null_column_expr(
     }
 }
 
+fn build_starts_with_expr(
+    expr: &Arc<dyn PhysicalExpr>,
+    prefix: &str,
+    schema: &Schema,
+    required_columns: &mut RequiredColumns,
+) -> Option<Arc<dyn PhysicalExpr>> {
+    if let Some(col) = expr.as_any().downcast_ref::<phys_expr::Column>() {
+        let field = schema.field_with_name(col.name()).ok()?;
+
+        let min_field = &Field::new(field.name(), DataType::UInt64, true);
+        let min_column_expr = required_columns.min_column_expr(col, expr, min_field).ok()?;
+
+        let max_field = &min_field.clone();
+        let max_column_expr = required_columns.max_column_expr(col, expr, max_field).ok()?;
+
+        let lit_prefix = phys_expr::lit(prefix.to_owned());
+        let lit_1 = phys_expr::lit(1i64);
+        let lit_len = phys_expr::lit(prefix.len() as i64);
+
+        let min_prefix = Arc::new(ScalarFunctionExpr::new(
+            "substr",
+            crate::functions::unicode::substr(),
+            vec![min_column_expr, lit_1.clone(), lit_len.clone()],
+            DataType::Utf8,
+        ));
+        let max_prefix = Arc::new(ScalarFunctionExpr::new(
+            "substr",
+            crate::functions::unicode::substr(),
+            vec![max_column_expr, lit_1.clone(), lit_len.clone()],
+            DataType::Utf8,
+        ));
+
+        Some(Arc::new(phys_expr::BinaryExpr::new(
+            phys_expr::binary(min_prefix, Operator::LtEq, lit_prefix.clone(), schema).ok()?,
+            Operator::And,
+            phys_expr::binary(max_prefix, Operator::GtEq, lit_prefix.clone(), schema).ok()?,
+        )))
+    } else {
+        None
+    }
+}
+
 /// The maximum number of entries in an `InList` that might be rewritten into
 /// an OR chain
 const MAX_LIST_VALUE_SIZE_REWRITE: usize = 20;
@@ -1591,6 +1633,20 @@ fn build_predicate_expression(
         };
         return expr;
     }
+    if let Some(scalar_fn) = expr_any.downcast_ref::<ScalarFunctionExpr>() {
+        if scalar_fn.name() == "starts_with" {
+            let arg1 = &scalar_fn.args()[0];
+            let arg2 = &scalar_fn.args()[1];
+            if let Some(literal) = arg2.as_any().downcast_ref::<phys_expr::Literal>() {
+                if let ScalarValue::Utf8(Some(prefix)) = literal.value() {
+                    return build_starts_with_expr(arg1, prefix, schema, required_columns)
+                        .unwrap_or(unhandled);
+                }
+            }
+        }
+        return unhandled;
+    }
+
 
     let expr_builder =
         PruningExpressionBuilder::try_new(&left, &right, op, schema, required_columns);
