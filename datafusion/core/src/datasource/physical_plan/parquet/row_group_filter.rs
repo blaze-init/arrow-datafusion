@@ -396,17 +396,49 @@ impl<'a, T: AsyncFileReader + Send + 'static> RowGroupPruningStatistics<'a, T> {
     }
 }
 
+macro_rules! is_min_max_deprecated {
+    ($self:expr, $column:expr) => {{
+        $self.row_group_metadatas
+            .iter()
+            .any(|row_group_metadata| row_group_metadata
+                .columns()
+                .iter()
+                .find(|c| c.column_path().string().eq_ignore_ascii_case(&$column.flat_name()))
+                .and_then(|c| c.statistics())
+                .map(|stat| stat.is_min_max_deprecated())
+                .unwrap_or(false))
+    }}
+}
+
 impl<'a, T: AsyncFileReader + Send + 'static> PruningStatistics for RowGroupPruningStatistics<'a, T> {
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
-        self.statistics_converter(column)
+        let min_values = self.statistics_converter(column)
             .and_then(|c| Ok(c.row_group_mins(self.metadata_iter())?))
-            .ok()
+            .ok();
+        if is_min_max_deprecated!(self, column) {
+            let max_values = self.statistics_converter(column)
+                .and_then(|c| Ok(c.row_group_maxes(self.metadata_iter())?))
+                .ok();
+            if min_values != max_values {
+                return None;
+            }
+        }
+        min_values
     }
 
     fn max_values(&self, column: &Column) -> Option<ArrayRef> {
-        self.statistics_converter(column)
+        let max_values = self.statistics_converter(column)
             .and_then(|c| Ok(c.row_group_maxes(self.metadata_iter())?))
-            .ok()
+            .ok();
+        if is_min_max_deprecated!(self, column) {
+            let min_values = self.statistics_converter(column)
+                .and_then(|c| Ok(c.row_group_mins(self.metadata_iter())?))
+                .ok();
+            if min_values != max_values {
+                return None;
+            }
+        }
+        max_values
     }
 
     fn num_containers(&self) -> usize {
