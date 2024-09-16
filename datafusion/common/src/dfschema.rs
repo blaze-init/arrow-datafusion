@@ -583,7 +583,7 @@ impl DFSchema {
             .fields
             .iter()
             .zip(arrow_schema.fields().iter())
-            .all(|(dffield, arrowfield)| dffield.name() == arrowfield.name())
+            .all(|(dffield, arrowfield)| dffield.name().eq_ignore_ascii_case(arrowfield.name()))
     }
 
     /// Check to see if fields in 2 Arrow schemas are compatible
