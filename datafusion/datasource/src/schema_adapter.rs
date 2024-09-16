@@ -276,7 +276,10 @@ impl SchemaAdapter for DefaultSchemaAdapter {
     /// Panics if index is not in range for the table schema
     fn map_column_index(&self, index: usize, file_schema: &Schema) -> Option<usize> {
         let field = self.projected_table_schema.field(index);
-        Some(file_schema.fields.find(field.name())?.0)
+        file_schema
+            .fields
+            .iter()
+            .position(|f| f.name().eq_ignore_ascii_case(field.name()))
     }
 
     /// Creates a `SchemaMapping` for casting or mapping the columns from the
