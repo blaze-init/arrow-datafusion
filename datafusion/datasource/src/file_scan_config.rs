@@ -770,9 +770,10 @@ impl FileScanConfig {
                     self.file_schema.field(idx).clone()
                 } else {
                     let partition_idx = idx - self.file_schema.fields().len();
-                    Arc::unwrap_or_clone(Arc::clone(
-                        &self.table_partition_cols[partition_idx],
-                    ))
+                    self.table_partition_cols[partition_idx]
+                        .as_ref()
+                        .clone()
+                        .with_nullable(true) // blaze: allow nullable parquet scan partition key
                 }
             })
             .collect();
