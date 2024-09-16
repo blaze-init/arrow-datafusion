@@ -27,6 +27,7 @@ mod like;
 mod negative;
 mod no_op;
 mod not;
+mod short_circuiting;
 mod try_cast;
 mod unknown_column;
 
@@ -53,5 +54,6 @@ pub use like::{like, LikeExpr};
 pub use negative::{negative, NegativeExpr};
 pub use no_op::NoOp;
 pub use not::{not, NotExpr};
+pub use short_circuiting::{SCAndExpr, SCOrExpr};
 pub use try_cast::{try_cast, TryCastExpr};
 pub use unknown_column::UnKnownColumn;
