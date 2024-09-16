@@ -1511,20 +1511,19 @@ fn build_starts_with_expr(
 
         let min_prefix = Arc::new(ScalarFunctionExpr::new(
             "substr",
-            crate::functions::unicode::substr(),
+            datafusion_functions::unicode::substr(),
             vec![min_column_expr, lit_1.clone(), lit_len.clone()],
-            DataType::Utf8,
+            Arc::new(Field::new("result", DataType::Utf8, true)),
         ));
         let max_prefix = Arc::new(ScalarFunctionExpr::new(
             "substr",
-            crate::functions::unicode::substr(),
+            datafusion_functions::unicode::substr(),
             vec![max_column_expr, lit_1.clone(), lit_len.clone()],
-            DataType::Utf8,
+            Arc::new(Field::new("result", DataType::Utf8, true)),
         ));
 
-        Some(Arc::new(phys_expr::BinaryExpr::new(
+        Some(Arc::new(phys_expr::SCAndExpr::new(
             phys_expr::binary(min_prefix, Operator::LtEq, lit_prefix.clone(), schema).ok()?,
-            Operator::And,
             phys_expr::binary(max_prefix, Operator::GtEq, lit_prefix.clone(), schema).ok()?,
         )))
     } else {
@@ -1673,6 +1672,38 @@ fn build_predicate_expression(
         }
     }
 
+    if let Some(sc_and) = expr_any.downcast_ref::<phys_expr::SCAndExpr>() {
+        let left_expr = build_predicate_expression(&sc_and.left, schema, required_columns, unhandled_hook);
+        let right_expr = build_predicate_expression(&sc_and.right, schema, required_columns, unhandled_hook);
+        return match (&left_expr, &right_expr) {
+            (l, _) if is_always_true(l) => right_expr,
+            (_, r) if is_always_true(r) => left_expr,
+            (_, _) => Arc::new(phys_expr::SCAndExpr::new(left_expr, right_expr)),
+        };
+    }
+    if let Some(sc_or) = expr_any.downcast_ref::<phys_expr::SCOrExpr>() {
+        let left_expr = build_predicate_expression(&sc_or.left, schema, required_columns, unhandled_hook);
+        let right_expr = build_predicate_expression(&sc_or.right, schema, required_columns, unhandled_hook);
+        if is_always_true(&left_expr) || is_always_true(&right_expr) {
+            return unhandled_hook.handle(expr);
+        } else {
+            return Arc::new(phys_expr::SCOrExpr::new(left_expr, right_expr));
+        }
+    }
+    if let Some(scalar_fn) = expr_any.downcast_ref::<ScalarFunctionExpr>() {
+        if scalar_fn.name() == "starts_with" {
+            let arg1 = &scalar_fn.args()[0];
+            let arg2 = &scalar_fn.args()[1];
+            if let Some(literal) = arg2.as_any().downcast_ref::<phys_expr::Literal>() {
+                if let ScalarValue::Utf8(Some(prefix)) = literal.value() {
+                    return build_starts_with_expr(arg1, prefix, schema, required_columns)
+                        .unwrap_or_else(|| unhandled_hook.handle(expr));
+                }
+            }
+        }
+        return unhandled_hook.handle(expr);
+    }
+
     let (left, op, right) = {
         if let Some(bin_expr) = expr_any.downcast_ref::<phys_expr::BinaryExpr>() {
             (
@@ -1722,24 +1753,13 @@ fn build_predicate_expression(
             (left, Operator::Or, _) if is_always_false(left) => right_expr,
             (_, Operator::Or, right) if is_always_false(right) => left_expr,
 
+            (_, Operator::And, _) => Arc::new(phys_expr::SCAndExpr::new(left_expr, right_expr)),
+            (_, Operator::Or, _) => Arc::new(phys_expr::SCOrExpr::new(left_expr, right_expr)),
             _ => Arc::new(phys_expr::BinaryExpr::new(left_expr, op, right_expr)),
+
         };
         return expr;
     }
-    if let Some(scalar_fn) = expr_any.downcast_ref::<ScalarFunctionExpr>() {
-        if scalar_fn.name() == "starts_with" {
-            let arg1 = &scalar_fn.args()[0];
-            let arg2 = &scalar_fn.args()[1];
-            if let Some(literal) = arg2.as_any().downcast_ref::<phys_expr::Literal>() {
-                if let ScalarValue::Utf8(Some(prefix)) = literal.value() {
-                    return build_starts_with_expr(arg1, prefix, schema, required_columns)
-                        .unwrap_or(unhandled);
-                }
-            }
-        }
-        return unhandled;
-    }
-
 
     let expr_builder =
         PruningExpressionBuilder::try_new(&left, &right, op, schema, required_columns);
@@ -1805,10 +1825,9 @@ fn build_statistics_expr(
             let has_no_stat_pred = Arc::new(phys_expr::IsNullExpr::new(stat_pred_expr.clone()));
             let has_no_dict = Arc::new(phys_expr::IsNullExpr::new(dict));
             let dict_contained = expr_builder.dict_column_contains_expr()?;
-            Arc::new(phys_expr::BinaryExpr::new(
-                Arc::new(phys_expr::BinaryExpr::new(has_no_stat_pred, Operator::Or, stat_pred_expr)),
-                Operator::And,
-                Arc::new(phys_expr::BinaryExpr::new(has_no_dict, Operator::Or, dict_contained)),
+            Arc::new(phys_expr::SCAndExpr::new(
+                Arc::new(phys_expr::SCOrExpr::new(has_no_stat_pred, stat_pred_expr)),
+                Arc::new(phys_expr::SCOrExpr::new(has_no_dict, dict_contained)),
             ))
         }
         Operator::NotLikeMatch => build_not_like_match(expr_builder)?,
