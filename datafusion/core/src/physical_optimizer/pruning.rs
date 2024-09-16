@@ -1515,9 +1515,8 @@ fn build_starts_with_expr(
             DataType::Utf8,
         ));
 
-        Some(Arc::new(phys_expr::BinaryExpr::new(
+        Some(Arc::new(phys_expr::SCAndExpr::new(
             phys_expr::binary(min_prefix, Operator::LtEq, lit_prefix.clone(), schema).ok()?,
-            Operator::And,
             phys_expr::binary(max_prefix, Operator::GtEq, lit_prefix.clone(), schema).ok()?,
         )))
     } else {
@@ -1629,9 +1628,30 @@ fn build_predicate_expression(
             {
                 unhandled
             }
-            _ => Arc::new(phys_expr::BinaryExpr::new(left_expr, op, right_expr)),
+            (_, Operator::And, _) => Arc::new(phys_expr::SCAndExpr::new(left_expr, right_expr)),
+            (_, Operator::Or, _) => Arc::new(phys_expr::SCOrExpr::new(left_expr, right_expr)),
+            _ => unreachable!(),
+
         };
         return expr;
+    }
+    if let Some(sc_and) = expr_any.downcast_ref::<phys_expr::SCAndExpr>() {
+        let left_expr = build_predicate_expression(&sc_and.left, schema, required_columns);
+        let right_expr = build_predicate_expression(&sc_and.right, schema, required_columns);
+        return match (&left_expr, &right_expr) {
+            (l, _) if is_always_true(l) => right_expr,
+            (_, r) if is_always_true(r) => left_expr,
+            (_, _) => Arc::new(phys_expr::SCAndExpr::new(left_expr, right_expr)),
+        };
+    }
+    if let Some(sc_or) = expr_any.downcast_ref::<phys_expr::SCOrExpr>() {
+        let left_expr = build_predicate_expression(&sc_or.left, schema, required_columns);
+        let right_expr = build_predicate_expression(&sc_or.right, schema, required_columns);
+        if is_always_true(&left_expr) || is_always_true(&right_expr) {
+            return unhandled;
+        } else {
+            return Arc::new(phys_expr::SCOrExpr::new(left_expr, right_expr));
+        }
     }
     if let Some(scalar_fn) = expr_any.downcast_ref::<ScalarFunctionExpr>() {
         if scalar_fn.name() == "starts_with" {
@@ -1710,10 +1730,9 @@ fn build_statistics_expr(
             let has_no_stat_pred = Arc::new(phys_expr::IsNullExpr::new(stat_pred_expr.clone()));
             let has_no_dict = Arc::new(phys_expr::IsNullExpr::new(dict));
             let dict_contained = expr_builder.dict_column_contains_expr()?;
-            Arc::new(phys_expr::BinaryExpr::new(
-                Arc::new(phys_expr::BinaryExpr::new(has_no_stat_pred, Operator::Or, stat_pred_expr)),
-                Operator::And,
-                Arc::new(phys_expr::BinaryExpr::new(has_no_dict, Operator::Or, dict_contained)),
+            Arc::new(phys_expr::SCAndExpr::new(
+                Arc::new(phys_expr::SCOrExpr::new(has_no_stat_pred, stat_pred_expr)),
+                Arc::new(phys_expr::SCOrExpr::new(has_no_dict, dict_contained)),
             ))
         }
         Operator::Gt => {
