@@ -288,7 +288,7 @@ impl FileScanConfig {
         )
     }
 
-    pub(crate) fn file_column_projection_indices(&self) -> Option<Vec<usize>> {
+    pub fn file_column_projection_indices(&self) -> Option<Vec<usize>> {
         self.projection.as_ref().map(|p| {
             p.iter()
                 .filter(|col_idx| **col_idx < self.file_schema.fields().len())
