@@ -22,8 +22,8 @@
 pub mod access_plan;
 pub mod file_format;
 mod metrics;
-mod opener;
-mod page_filter;
+pub mod opener;
+pub mod page_filter;
 mod reader;
 mod row_filter;
 mod row_group_filter;

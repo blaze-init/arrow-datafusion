@@ -355,16 +355,16 @@ where
 pub struct SchemaMapping {
     /// The schema of the table. This is the expected schema after conversion
     /// and it should match the schema of the query result.
-    projected_table_schema: SchemaRef,
+    pub projected_table_schema: SchemaRef,
     /// Mapping from field index in `projected_table_schema` to index in
     /// projected file_schema.
     ///
     /// They are Options instead of just plain `usize`s because the table could
     /// have fields that don't exist in the file.
-    field_mappings: Vec<Option<usize>>,
+    pub field_mappings: Vec<Option<usize>>,
     /// Function used to adapt a column from the file schema to the table schema
     /// when it exists in both schemas
-    cast_column: Arc<CastColumnFn>,
+    pub cast_column: Arc<CastColumnFn>,
 }
 
 impl Debug for SchemaMapping {

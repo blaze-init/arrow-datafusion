@@ -52,7 +52,7 @@ use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::ParquetMetaDataReader;
 
 /// Implements [`FileOpener`] for a parquet file
-pub(super) struct ParquetOpener {
+pub struct ParquetOpener {
     /// Execution partition index
     pub partition_index: usize,
     /// Column indexes in `table_schema` needed by the query
@@ -95,7 +95,7 @@ pub(super) struct ParquetOpener {
     /// Optional parquet FileDecryptionProperties
     pub file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
     /// Rewrite expressions in the context of the file schema
-    pub(crate) expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+    pub expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
 }
 
 impl FileOpener for ParquetOpener {
