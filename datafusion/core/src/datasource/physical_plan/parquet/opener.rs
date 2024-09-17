@@ -40,7 +40,7 @@ use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use std::sync::Arc;
 
 /// Implements [`FileOpener`] for a parquet file
-pub(super) struct ParquetOpener {
+pub struct ParquetOpener {
     pub partition_index: usize,
     pub projection: Arc<[usize]>,
     pub batch_size: usize,
