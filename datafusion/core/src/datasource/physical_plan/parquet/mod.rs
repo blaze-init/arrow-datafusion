@@ -48,7 +48,7 @@ use log::debug;
 mod access_plan;
 mod metrics;
 mod opener;
-mod page_filter;
+pub mod page_filter;
 mod reader;
 mod row_filter;
 mod row_group_filter;
@@ -59,7 +59,7 @@ use crate::datasource::schema_adapter::{
 };
 pub use access_plan::{ParquetAccessPlan, RowGroupAccess};
 pub use metrics::ParquetFileMetrics;
-use opener::ParquetOpener;
+pub use opener::ParquetOpener;
 pub use reader::{DefaultParquetFileReaderFactory, ParquetFileReaderFactory};
 pub use writer::plan_to_parquet;
 

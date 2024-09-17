@@ -173,9 +173,9 @@ impl SchemaAdapter for DefaultSchemaAdapter {
 #[derive(Debug)]
 pub struct SchemaMapping {
     /// The schema of the table. This is the expected schema after conversion and it should match the schema of the query result.
-    table_schema: SchemaRef,
+    pub table_schema: SchemaRef,
     /// Mapping from field index in `table_schema` to index in projected file_schema
-    field_mappings: Vec<Option<usize>>,
+    pub field_mappings: Vec<Option<usize>>,
 }
 
 impl SchemaMapper for SchemaMapping {
