@@ -929,6 +929,7 @@ fn build_statistics_record_batch<S: PruningStatistics>(
     let mut arrays = Vec::<ArrayRef>::new();
     // For each needed statistics column:
     for (column, statistics_type, stat_field) in required_columns.iter() {
+        log::warn!("XXX build_statistics_record_batch: col={column:?}, stat_type={statistics_type:?}, stat_field={stat_field:?}");
         let column = Column::from_name(column.name());
         let data_type = stat_field.data_type();
 
