@@ -66,22 +66,22 @@ version = "41.0.0"
 ahash = { version = "0.8", default-features = false, features = [
     "runtime-rng",
 ] }
-arrow = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "863233c716", features = [
+arrow = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "f8ed6ecf56", features = [
     "prettyprint",
 ] }
-arrow-array = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "863233c716", default-features = false, features = [
+arrow-array = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "f8ed6ecf56", default-features = false, features = [
     "chrono-tz",
 ] }
-arrow-buffer = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "863233c716", default-features = false }
-arrow-flight = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "863233c716", features = [
+arrow-buffer = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "f8ed6ecf56", default-features = false }
+arrow-flight = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "f8ed6ecf56", features = [
     "flight-sql-experimental",
 ] }
-arrow-ipc = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "863233c716", default-features = false, features = [
+arrow-ipc = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "f8ed6ecf56", default-features = false, features = [
     "lz4",
 ] }
-arrow-ord = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "863233c716", default-features = false }
-arrow-schema = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "863233c716", default-features = false }
-arrow-string = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "863233c716", default-features = false }
+arrow-ord = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "f8ed6ecf56", default-features = false }
+arrow-schema = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "f8ed6ecf56", default-features = false }
+arrow-string = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "f8ed6ecf56", default-features = false }
 async-trait = "0.1.73"
 bigdecimal = "=0.4.1"
 bytes = "1.4"
@@ -118,7 +118,7 @@ log = "^0.4"
 num_cpus = "1.13.0"
 object_store = { version = "0.10.2", default-features = false }
 parking_lot = "0.12"
-parquet = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "863233c716", default-features = false, features = [
+parquet = { git = "https://github.com/blaze-init/arrow-rs.git", rev = "f8ed6ecf56", default-features = false, features = [
     "arrow",
     "async",
     "object_store",

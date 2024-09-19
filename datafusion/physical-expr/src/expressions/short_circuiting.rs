@@ -114,7 +114,7 @@ impl SCOrExpr {
 
 impl Display for SCOrExpr {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "({} &&(SC) {})", self.left, self.right)
+        write!(f, "({} ||(SC) {})", self.left, self.right)
     }
 }
 

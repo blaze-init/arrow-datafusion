@@ -109,42 +109,57 @@ impl RowGroupAccessPlanFilter {
         arrow_schema: &Schema,
         groups: &[RowGroupMetaData],
         predicate: &PruningPredicate,
-        use_dictionary_filtering: bool,
         metrics: &ParquetFileMetrics,
     ) {
         assert_eq!(groups.len(), self.access_plan.len());
         // Indexes of row groups still to scan
+        // blaze: for less reading of dictionary pages, we still prune in separated passes
         let row_group_indexes = self.access_plan.row_group_indexes();
-        let row_group_metadatas = row_group_indexes
-            .iter()
-            .map(|&i| &groups[i])
-            .collect::<Vec<_>>();
+        for &rg_idx in &row_group_indexes {
+            let row_group_metadatas = row_group_indexes
+                .iter()
+                .map(|&i| &groups[i])
+                .skip(rg_idx)
+                .take(1)
+                .collect::<Vec<_>>();
 
-        let pruning_stats = RowGroupPruningStatistics {
-            row_group_metadatas,
-            arrow_schema,
-            use_dictionary_filtering,
-            cached_dictionaries: vec![OnceCell::new(); arrow_schema.fields().len()],
-            builder: RefCell::new(builder),
-        };
+            let mut pruning_stats = RowGroupPruningStatistics {
+                row_group_metadatas,
+                arrow_schema,
+                use_dictionary_filtering: false,
+                cached_dictionaries: vec![],
+                builder: RefCell::new(builder),
+            };
 
-        // try to prune the row groups in a single call
-        match predicate.prune(&pruning_stats) {
-            Ok(values) => {
-                // values[i] is false means the predicate could not be true for row group i
-                for (idx, &value) in row_group_indexes.iter().zip(values.iter()) {
-                    if !value {
-                        self.access_plan.skip(*idx);
-                        metrics.row_groups_pruned_statistics.add(1);
-                    } else {
-                        metrics.row_groups_matched_statistics.add(1);
+            // prune using two runs because pruning with dictionary filtering is more expensive
+            // first run: prune without dictionary filtering
+            match predicate.prune(&pruning_stats) {
+                Ok(values) => {
+                    if !values[0] {
+                        self.access_plan.skip(rg_idx);
+                        continue; // no need to prune with dictionary
                     }
                 }
+                Err(e) => {
+                    log::info!("Error evaluating row group predicate values without dictionary {e}");
+                    metrics.predicate_evaluation_errors.add(1);
+                    continue; // no need to prune with dictionary
+                }
             }
-            // stats filter array could not be built, so we can't prune
-            Err(e) => {
-                log::debug!("Error evaluating row group predicate values {e}");
-                metrics.predicate_evaluation_errors.add(1);
+
+            // second run: prune with dictionary filtering
+            pruning_stats.use_dictionary_filtering = true;
+            pruning_stats.cached_dictionaries = vec![OnceCell::new(); arrow_schema.fields().len()];
+            match predicate.prune(&pruning_stats) {
+                Ok(values) => {
+                    if !values[0] {
+                        self.access_plan.skip(rg_idx);
+                    }
+                }
+                Err(e) => {
+                    log::info!("Error evaluating row group predicate values with dictionary {e}");
+                    metrics.predicate_evaluation_errors.add(1);
+                }
             }
         }
     }
@@ -463,9 +478,6 @@ impl<'a, T: AsyncFileReader + Send + 'static> PruningStatistics for RowGroupPrun
         if !self.use_dictionary_filtering {
             return None;
         }
-        if self.row_group_metadatas.is_empty() {
-            return None;
-        }
 
         let col_idx = self
             .row_group_metadatas
@@ -477,23 +489,24 @@ impl<'a, T: AsyncFileReader + Send + 'static> PruningStatistics for RowGroupPrun
 
         self.cached_dictionaries[col_idx].get_or_init(|| {
             let mut values = vec![];
-            for &row_group_metadata in &self.row_group_metadatas {
-                let dict_values = match futures::executor::block_on(async move {
+            for row_group_metadata in self.metadata_iter() {
+                let dict_values =
                     parquet::blaze::get_dictionary_for_pruning(
                         &mut self.builder.borrow_mut().input.0,
                         row_group_metadata,
                         col_idx,
-                    ).await
-                }) {
-                    Ok(Some(dict_values)) => dict_values,
-                    _ => return None,
-                };
-                let dict_array = ListArray::try_new(
-                    Arc::new(Field::new("items", dict_values.data_type().clone(), false)),
-                    OffsetBuffer::new(ScalarBuffer::from(vec![0, dict_values.len() as i32])),
-                    dict_values,
-                    None,
-                ).ok()?;
+                    )
+                    .ok()
+                    .flatten()?;
+
+                let dict_array =
+                    ListArray::try_new(
+                        Arc::new(Field::new("items", dict_values.data_type().clone(), false)),
+                        OffsetBuffer::new(ScalarBuffer::from(vec![0, dict_values.len() as i32])),
+                        dict_values,
+                        None,
+                    )
+                    .ok()?;
                 values.push(dict_array);
             }
             arrow::compute::concat(&values.iter()
