@@ -856,6 +856,11 @@ fn check_short_circuit<'a>(
     lhs: &'a ColumnarValue,
     op: &Operator,
 ) -> ShortCircuitStrategy<'a> {
+
+    // blaze: always disable ShortCircuitStrategy because
+    // it conflicts with blaze's CachedExprEvaluator
+    return ShortCircuitStrategy::None;
+    
     // Quick reject for non-logical operators,and quick judgment when op is and
     let is_and = match op {
         Operator::And => true,
